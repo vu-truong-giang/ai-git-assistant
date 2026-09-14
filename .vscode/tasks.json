@@ -3,6 +3,16 @@
 {
 	"version": "2.0.0",
 	"tasks": [
+        {
+            "type": "npm",
+            "script": "compile",
+            "problemMatcher": "$tsc",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "label": "npm: compile"
+        },
 		{
             "label": "watch",
             "dependsOn": [
@@ -13,15 +23,13 @@
                 "reveal": "never"
             },
             "group": {
-                "kind": "build",
-                "isDefault": true
+                "kind": "build"
             }
         },
         {
             "type": "npm",
             "script": "watch:esbuild",
             "group": "build",
-            "problemMatcher": "$esbuild-watch",
             "isBackground": true,
             "label": "npm: watch:esbuild",
             "presentation": {
