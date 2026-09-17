@@ -17,7 +17,22 @@
         "command": "ai-git-asistant.helloWorld",
         "title": "Hello World"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "AI Git Assistant",
+      "properties": {
+          "aiGitAssistant.ai.enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable AI features in AI Git Assistant."
+          },
+          "aiGitAssistant.ai.model": {
+              "type": "string",
+              "default": "gpt-5.6",
+              "description": "AI model used by AI Git Assistant."
+          }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
