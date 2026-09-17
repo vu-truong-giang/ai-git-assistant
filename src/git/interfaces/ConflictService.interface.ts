@@ -1,6 +1,6 @@
 import { GitConflict } from '../models/GitConflict.model';
 
-export interface ConflictService {
+export interface IConflictService {
     getConflicts(): Promise<GitConflict[]>;
     hasConflicts(): Promise<boolean>;
 

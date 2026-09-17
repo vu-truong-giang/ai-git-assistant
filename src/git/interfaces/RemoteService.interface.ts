@@ -1,6 +1,6 @@
 import { GitRemote } from '../models/GitRemote.model';
 
-export interface RemoteService {
+export interface IRemoteService {
   getRemotes(): Promise<GitRemote[]>;
 
   fetch(remote?: string): Promise<GitRemote[]>;

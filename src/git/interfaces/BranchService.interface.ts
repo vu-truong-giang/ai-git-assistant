@@ -1,6 +1,6 @@
 import { GitBranch } from '../models/GitBranch.model';
 
-export interface BranchService {
+export interface IBranchService {
     getBranches(): Promise<GitBranch[]>;
     getCurrentBranch(): Promise<GitBranch>;
     createBranch(branchName: string, checkout?: boolean): Promise<void>;
