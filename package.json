@@ -16,8 +16,35 @@
       {
         "command": "ai-git-asistant.helloWorld",
         "title": "Hello World"
+      },
+      {
+        "command": "aiGitAssistant.refreshChanges",
+        "title": "Refresh Changes",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aiGitAssistant.openDiff",
+        "title": "Open Diff"
       }
     ],
+    "views": {
+      "scm": [
+        {
+          "id": "aiGitAssistantChanges",
+          "name": "AI Git Changes Context",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "aiGitAssistant.refreshChanges",
+          "when": "view == aiGitAssistantChanges",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "AI Git Assistant",
       "properties": {
