@@ -11,7 +11,7 @@ export class GitFileChangeItem extends vscode.TreeItem {
         super(fileStatus.filePath, collapsibleState);
         this.tooltip = `${this.fileStatus.filePath} (Status: ${this.fileStatus.status})`;
         this.description = this.fileStatus.status;
-        
+
         this.iconPath = this.getIconForStatus(this.fileStatus.status);
     }
 
@@ -38,7 +38,7 @@ export class GitChangesProvider implements vscode.TreeDataProvider<GitFileChange
     private _onDidChangeTreeData: vscode.EventEmitter<GitFileChangeItem | undefined | void> = new vscode.EventEmitter<GitFileChangeItem | undefined | void>();
     readonly onDidChangeTreeData: vscode.Event<GitFileChangeItem | undefined | void> = this._onDidChangeTreeData.event;
 
-    constructor(private statusService: IStatusService) {}
+    constructor(private statusService: IStatusService) { }
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -64,7 +64,7 @@ export class GitChangesProvider implements vscode.TreeDataProvider<GitFileChange
                     arguments: [status.filePath]
                 }
             ));
-        } catch (error) {
+        } catch {
             vscode.window.showErrorMessage('Error fetching git status');
             return [];
         }

@@ -11,9 +11,7 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    
-  ],
+  "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -56,16 +54,16 @@
     "configuration": {
       "title": "AI Git Assistant",
       "properties": {
-          "aiGitAssistant.ai.enabled": {
-              "type": "boolean",
-              "default": true,
-              "description": "Enable AI features in AI Git Assistant."
-          },
-          "aiGitAssistant.ai.model": {
-              "type": "string",
-              "default": "gpt-5.6",
-              "description": "AI model used by AI Git Assistant."
-          }
+        "aiGitAssistant.ai.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable AI features in AI Git Assistant."
+        },
+        "aiGitAssistant.ai.model": {
+          "type": "string",
+          "default": "gpt-5.6",
+          "description": "AI model used by AI Git Assistant."
+        }
       }
     }
   },
@@ -83,13 +81,14 @@
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.4.1",
-    "eslint": "^9.0.0",
     "esbuild": "^0.25.0",
+    "eslint": "^9.0.0",
     "npm-run-all": "^4.1.5",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.0.0"

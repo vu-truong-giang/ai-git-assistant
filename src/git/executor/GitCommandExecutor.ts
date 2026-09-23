@@ -9,15 +9,15 @@ export class GitCommandExecutor {
             let stdout = '';
             let stderr = '';
 
-            process.stdout.on('data', (data) => {
+            process.stdout.on('data', (data: Buffer) => {
                 stdout += data.toString();
             });
 
-            process.stderr.on('data', (data) => {
+            process.stderr.on('data', (data: Buffer) => {
                 stderr += data.toString();
             });
 
-            process.on('close', (code) => {
+            process.on('close', (code: number | null) => {
                 if (code === 0) {
                     resolve(stdout);
                 } else {
@@ -25,7 +25,7 @@ export class GitCommandExecutor {
                 }
             });
 
-            process.on('error', (err) => {
+            process.on('error', (err: Error) => {
                 reject(new Error(`Failed to spawn git command: ${err.message}`));
             });
         });
