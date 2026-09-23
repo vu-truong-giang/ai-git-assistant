@@ -11,19 +11,30 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(helloWorld);
 
   const workspaceService: IWorkspaceService = new WorkspaceService();
+  const wsPath = workspaceService.getWorkspacePath();  
+  const wsFolder = workspaceService.getWorkspaceFolder();
+  const wsName = workspaceService.getWorkspaceName();
+  const isWs = workspaceService.hasWorkspace();
+
   const workspaceCommand = vscode.commands.registerCommand(
     'ai-git-assistant.getWorkspaceInfo',
     () => {
-        if( !workspaceService.hasWorkspace() ) {
+        if( !isWs ) {
             vscode.window.showWarningMessage('No workspace is opened. Please open a workspace to use AI Git Assistant.');
             return;
         }
-        const workspacePath = workspaceService.getWorkspacePath();
-        if( !workspacePath ) {
+        
+        if( !wsPath ) {
             vscode.window.showWarningMessage('Cannot determine the workspace path. Please check your workspace settings.');
             return;
         }
-        vscode.window.showInformationMessage(`Workspace path: ${workspacePath}`);
+        vscode.window.showInformationMessage(`Name: ${wsName}`)
+        if(!wsFolder){
+          vscode.window.showWarningMessage(' not find folder');
+        } else {
+          vscode.window.showInformationMessage(`Folder: ${wsFolder}`);
+        }
+        vscode.window.showInformationMessage(`Workspace path: ${wsPath}`);
         }
     );
     context.subscriptions.push(workspaceCommand);
