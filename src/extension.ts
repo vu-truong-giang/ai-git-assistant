@@ -1,30 +1,30 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import { GitCommandExecutor } from './git/executor/GitCommandExecutor';
 import { GitStatusService } from './git/services/GitStatus.service';
 import { GitChangesProvider } from './ui/GitChangesProvider';
-
 import { GitDiffService } from './git/services/GitDiff.service';
 import { GitDiffContentProvider } from './ui/GitDiffContentProvider';
 import * as path from 'path';
+import { WorkspaceService } from './workspace/workspaceService.service';
+import { IWorkspaceService } from './workspace/IWorkspaceService.interface';
+export function activate(context: vscode.ExtensionContext): void {
+  const helloWorld = vscode.commands.registerCommand(
+    'ai-git-assistant.helloWorld',
+    () => {
+      void vscode.window.showInformationMessage('AI Git Assistant is ready.');
+    }
+  );
+  context.subscriptions.push(helloWorld);
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
-export function activate(context: vscode.ExtensionContext) {
+  const workspaceService: IWorkspaceService = new WorkspaceService();
+  const wsPath = workspaceService.getWorkspacePath();  
+  const wsFolder = workspaceService.getWorkspaceFolder();
+  const wsName = workspaceService.getWorkspaceName();
+  const isWs = workspaceService.hasWorkspace();
 
 	// Use the console to output diagnostic information (console.log) and errors (console.error)
 	// This line of code will only be executed once when your extension is activated
-	console.log('Congratulations, your extension "ai-git-asistant" is now active!');
-
-	// The command has been defined in the package.json file
-	// Now provide the implementation of the command with registerCommand
-	// The commandId parameter must match the command field in package.json
-	const disposable = vscode.commands.registerCommand('ai-git-asistant.helloWorld', () => {
-		vscode.window.showInformationMessage('Hello World from ai git assistant extension!');
-	});
-
-	context.subscriptions.push(disposable);
+	console.log('Congratulations, your extension "ai-git-assistant" is now active!');
 
 	// Setup Git AI Assistant UI Components
 	const workspaceRoot = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
@@ -65,7 +65,28 @@ export function activate(context: vscode.ExtensionContext) {
 
 		context.subscriptions.push(refreshCmd, openDiffCmd);
 	}
-}
 
-// This method is called when your extension is deactivated
-export function deactivate() {}
+  const workspaceCommand = vscode.commands.registerCommand(
+    'ai-git-assistant.getWorkspaceInfo',
+    () => {
+        if( !isWs ) {
+            vscode.window.showWarningMessage('No workspace is opened. Please open a workspace to use AI Git Assistant.');
+            return;
+        }
+        
+        if( !wsPath ) {
+            vscode.window.showWarningMessage('Cannot determine the workspace path. Please check your workspace settings.');
+            return;
+        }
+        vscode.window.showInformationMessage(`Name: ${wsName}`)
+        if(!wsFolder){
+          vscode.window.showWarningMessage(' not find folder');
+        } else {
+          vscode.window.showInformationMessage(`Folder: ${wsFolder}`);
+        }
+        vscode.window.showInformationMessage(`Workspace path: ${wsPath}`);
+        }
+    );
+    context.subscriptions.push(workspaceCommand);
+}
+export function deactivate(): void {}
