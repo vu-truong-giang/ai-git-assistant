@@ -21,16 +21,20 @@
       },
       {
         "command": "aiGitAssistant.refreshChanges",
-        "title": "Refresh Changes",
+        "title": "AI Git Assistant: Refresh Changes",
         "icon": "$(refresh)"
       },
       {
         "command": "aiGitAssistant.openDiff",
-        "title": "Open Diff"
+        "title": "AI Git Assistant: Open Diff"
       },
       {
         "command": "ai-git-assistant.getWorkspaceInfo",
         "title": "AI Git Assistant: Check WorkspaceInfo"
+      },
+      {
+        "command": "ai-git-assistant.checkGitRepository",
+        "title": "AI Git Assistant: Check Git Repository"
       }
     ],
     "views": {

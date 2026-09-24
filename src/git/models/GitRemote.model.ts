@@ -1,6 +1,5 @@
 export type GitRemoteType = 'origin' | 'upstream';
 
-
 export interface GitRemote {
   name: string;
   type: GitRemoteType;
