@@ -10,6 +10,6 @@ export interface GitDiffChange {
 export interface GitDiff {
     filePath: string;
     changes: GitDiffChange[];
-    additions: number; // Number of lines added
-    deletions: number; // Number of lines deleted
+    additions: number;
+    deletions: number;
 }
