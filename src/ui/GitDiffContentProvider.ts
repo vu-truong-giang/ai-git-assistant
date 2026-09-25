@@ -7,9 +7,6 @@ export class GitDiffContentProvider implements vscode.TextDocumentContentProvide
     constructor(private diffService: IDiffService) {}
 
     async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
-        // The URI path will contain the file path
-        // The URI query will contain the ref (e.g., HEAD)
-        
         const filePath = uri.path;
         const ref = uri.query || 'HEAD';
 

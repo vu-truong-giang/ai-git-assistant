@@ -22,11 +22,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const wsName = workspaceService.getWorkspaceName();
   const isWs = workspaceService.hasWorkspace();
 
-	// Use the console to output diagnostic information (console.log) and errors (console.error)
-	// This line of code will only be executed once when your extension is activated
 	console.log('Congratulations, your extension "ai-git-assistant" is now active!');
 
-	// Setup Git AI Assistant UI Components
 	const workspaceRoot = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
 		? vscode.workspace.workspaceFolders[0].uri.fsPath
 		: undefined;
