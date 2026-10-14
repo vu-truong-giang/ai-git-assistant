@@ -18,47 +18,51 @@ export class GitStatusService implements IStatusService {
             for (const line of lines) {
                 if (line.trim().length === 0) continue;
 
-                const statusStr = line.substring(0, 2);
+                const x = line[0];
+                const y = line[1];
                 const filePath = line.substring(3).trim();
 
-                let statusType: GitFileStatusType = 'untracked';
-                let staged = false;
-
-                // X (Index) and Y (Working tree)
-                const x = statusStr[0];
-                const y = statusStr[1];
-
-                if (x === 'M' || x === 'A' || x === 'D' || x === 'R' || x === 'C') {
-                    staged = true;
+                if (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D')) {
+                    changes.push({ filePath, status: 'conflicted', staged: false });
+                    continue;
                 }
-                
+
                 if (x === '?' && y === '?') {
-                    statusType = 'untracked';
-                } else if (x === 'M' || y === 'M') {
-                    statusType = 'modified';
-                } else if (x === 'A' || y === 'A') {
-                    statusType = 'added';
-                } else if (x === 'D' || y === 'D') {
-                    statusType = 'deleted';
-                } else if (x === 'R' || y === 'R') {
-                    statusType = 'renamed';
-                } else if (x === 'C' || y === 'C') {
-                    statusType = 'copied';
-                } else if (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D')) {
-                    statusType = 'conflicted';
+                    changes.push({ filePath, status: 'untracked', staged: false });
+                    continue;
                 }
 
-                changes.push({
-                    filePath,
-                    status: statusType,
-                    staged
-                });
+                if (x === '!' && y === '!') {
+                    changes.push({ filePath, status: 'ignored', staged: false });
+                    continue;
+                }
+
+                if (x !== ' ' && x !== '?') {
+                    const stagedType = this.mapCharToStatus(x);
+                    changes.push({ filePath, status: stagedType, staged: true });
+                }
+
+                if (y !== ' ' && y !== '?') {
+                    const unstagedType = this.mapCharToStatus(y);
+                    changes.push({ filePath, status: unstagedType, staged: false });
+                }
             }
 
             return changes;
         } catch (error) {
             console.error('Failed to get git status', error);
             return [];
+        }
+    }
+
+    private mapCharToStatus(char: string): GitFileStatusType {
+        switch (char) {
+            case 'M': return 'modified';
+            case 'A': return 'added';
+            case 'D': return 'deleted';
+            case 'R': return 'renamed';
+            case 'C': return 'copied';
+            default: return 'modified';
         }
     }
 

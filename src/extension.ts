@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { GitCommandExecutor } from './git/executor/GitCommandExecutor';
 import { GitStatusService } from './git/services/GitStatus.service';
-import { GitChangesProvider } from './ui/GitChangesProvider';
+import { GitChangesWebviewProvider } from './ui/GitChangesWebviewProvider';
 import { GitDiffService } from './git/services/GitDiff.service';
 import { GitDiffContentProvider } from './ui/GitDiffContentProvider';
 import * as path from 'path';
@@ -24,7 +24,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const wsName = workspaceService.getWorkspaceName();
   const isWs = workspaceService.hasWorkspace();
 
-	
   const workspaceCommand = vscode.commands.registerCommand(
     'ai-git-assistant.getWorkspaceInfo',
     () => {
@@ -37,7 +36,7 @@ export function activate(context: vscode.ExtensionContext): void {
             vscode.window.showWarningMessage('Cannot determine the workspace path. Please check your workspace settings.');
             return;
         }
-        vscode.window.showInformationMessage(`Name: ${wsName}`)
+        vscode.window.showInformationMessage(`Name: ${wsName}`);
         if(!wsFolder){
           vscode.window.showWarningMessage(' not find folder');
         } else {
@@ -80,10 +79,14 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     // =========================
-    // Git Status
+    // Git Status & Webview UI
     // =========================
     const statusService = new GitStatusService(executor);
-    const gitChangesProvider = new GitChangesProvider(statusService);
+    const gitChangesWebviewProvider = new GitChangesWebviewProvider(context.extensionUri, statusService);
+
+    context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(GitChangesWebviewProvider.viewType, gitChangesWebviewProvider)
+    );
 
     // =========================
     // Git Diff
@@ -91,14 +94,12 @@ export function activate(context: vscode.ExtensionContext): void {
     const diffService = new GitDiffService(executor);
     const diffProvider = new GitDiffContentProvider(diffService);
 
-    vscode.window.registerTreeDataProvider('aiGitAssistantChanges', gitChangesProvider);
-
     context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider(GitDiffContentProvider.scheme, diffProvider)
     );
     
 		const refreshCmd = vscode.commands.registerCommand('aiGitAssistant.refreshChanges', () => {
-      gitChangesProvider.refresh();
+      gitChangesWebviewProvider.updateHtml();
 		});
 
 		const openDiffCmd = vscode.commands.registerCommand('aiGitAssistant.openDiff', async (filePath: string) => {
