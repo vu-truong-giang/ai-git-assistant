@@ -1,4 +1,4 @@
-import { IRepositoryService } from './RepositoryService.interface';
+import { IGitRepositoryService } from './IGitRepositoryService';
 import { IStatusService } from './StatusService.interface';
 import { IDiffService } from './DiffService.interface';
 import { IBranchService } from './BranchService.interface';
@@ -7,7 +7,7 @@ import { IRemoteService } from './RemoteService.interface';
 import { IConflictService } from './ConflictService.interface';
 
 export interface IGitService {
-    readonly repository: IRepositoryService;
+    readonly repository: IGitRepositoryService;
     readonly status: IStatusService;
     readonly diff: IDiffService;
     readonly branch: IBranchService;
