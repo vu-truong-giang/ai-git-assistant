@@ -1,5 +1,5 @@
 import { IGitRepositoryService } from './IGitRepositoryService';
-import { IStatusService } from './StatusService.interface';
+import { IStatusService } from './IGitStatusService';
 import { IDiffService } from './DiffService.interface';
 import { IBranchService } from './BranchService.interface';
 import { ICommitService } from './CommitService.interface';
