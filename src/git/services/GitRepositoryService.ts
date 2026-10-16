@@ -1,41 +1,33 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
 
+import { GitCommandExecutor } from './../executor/GitCommandExecutor'
 import {
     GitRepositoryInfo,
     IGitRepositoryService
 } from './../interfaces/IGitRepositoryService';
 
-const execAsync = promisify(exec);
 
-export class GitRepositoryService
-    implements IGitRepositoryService {
-
+export class GitRepositoryService implements IGitRepositoryService {
+    constructor(
+        private readonly executor: GitCommandExecutor
+    ){}
     async checkRepository(
         workspacePath: string
     ): Promise<GitRepositoryInfo> {
-
         try {
-            const { stdout } = await execAsync(
-                'git rev-parse --show-toplevel',
-                {
-                    cwd: workspacePath
-                }
-            );
-
-            const repositoryRoot = stdout.trim();
-
+            const result = await this.executor.execute(
+                ['rev-prase','--show-top-level'],
+                workspacePath
+            )
+            const repositoryRoot = result.trim();
             if (!repositoryRoot) {
                 return {
                     isGitRepository: false
                 };
             }
-
             return {
                 isGitRepository: true,
                 repositoryRoot
             };
-
         } catch {
             return {
                 isGitRepository: false

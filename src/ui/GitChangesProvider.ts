@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { IStatusService } from '../git/interfaces/StatusService.interface';
+import { IStatusService } from '../git/interfaces/IGitStatusService';
 import { GitFileStatus, GitFileStatusType } from '../git/models/GitFileStatus.model';
 
 export class GitFileChangeItem extends vscode.TreeItem {

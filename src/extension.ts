@@ -18,6 +18,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   context.subscriptions.push(helloWorld);
 
+  
   const workspaceService: IWorkspaceService = new WorkspaceService();
   const wsPath = workspaceService.getWorkspacePath();  
   const wsFolder = workspaceService.getWorkspaceFolder();
@@ -49,9 +50,10 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(workspaceCommand);
 
   if (wsPath) {
-		const executor = new GitCommandExecutor(wsPath);
+    const executor = new GitCommandExecutor();
+    
     // Git Repository 
-    const repositoryService: IGitRepositoryService = new GitRepositoryService();
+    const repositoryService: IGitRepositoryService = new GitRepositoryService(executor);
     const checkGitRepositoryCmd =
     vscode.commands.registerCommand(
       'ai-git-assistant.checkGitRepository',

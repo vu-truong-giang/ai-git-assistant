@@ -1,5 +1,5 @@
-import { IStatusService } from '../interfaces/StatusService.interface';
-import { GitFileStatus, GitFileStatusType } from '../models/GitFileStatus.model';
+import { IStatusService } from '../interfaces/IGitStatusService';
+import { GitFileStatus, GitFileStatusType , GitAheadBehind} from '../models/GitFileStatus.model';
 import { GitCommandExecutor } from '../executor/GitCommandExecutor';
 
 export class GitStatusService implements IStatusService {
@@ -75,5 +75,17 @@ export class GitStatusService implements IStatusService {
     async getUntrackedFiles(): Promise<GitFileStatus[]> {
         const allStatus = await this.getStatus();
         return allStatus.filter(file => file.status === 'untracked');
+    }
+    async getAheadBehind(): Promise<GitAheadBehind> {
+        try {
+            const stdout = await this.executor.execute(['rev-list', '--left-right', '--count', 'HEAD...@{u}']);
+            const [aheadStr, behindStr] = stdout.trim().split('\t');
+            const ahead = parseInt(aheadStr, 10);
+            const behind = parseInt(behindStr, 10);
+            return { ahead, behind };
+        } catch {
+            console.error('Failed to get ahead/behind information');
+            return { ahead: 0, behind: 0 };
+        }   
     }
 }

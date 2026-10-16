@@ -16,3 +16,7 @@ export interface GitFileStatus {
     additions?: number;
     deletions?: number;
 }
+export interface GitAheadBehind {
+    ahead: number;
+    behind: number;
+}
