@@ -1,17 +1,19 @@
-import { IBranchService } from '../interfaces/BranchService.interface';
+import { IBranchService } from '../interfaces/IGitBranchService';
 import { GitBranch } from '../models/GitBranch.model';
 import { GitCommandExecutor } from '../executor/GitCommandExecutor';
-
+import { GitStatusService } from './GitStatus.service';
 export class GitBranchService implements IBranchService {
-    constructor(private executor: GitCommandExecutor) {}
+    constructor(
+        private executor: GitCommandExecutor, 
+        private statusService: GitStatusService) {}
 
     async getCurrentBranch(): Promise<GitBranch> {
         try {
             const name = (await this.executor.execute(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
 
-            const tracking = await this.getTrackingBranch(name);
+            const tracking = await this.getTrackingBranch();
 
-            const { ahead, behind } = await this.getAheadBehind(name);
+            const { ahead, behind } = await this.statusService.getAheadBehind();
 
             return {
                 name,
@@ -27,10 +29,10 @@ export class GitBranchService implements IBranchService {
         }
     }
 
-    async getTrackingBranch(branchName: string): Promise<string | undefined> {
+    async getTrackingBranch(): Promise<string | undefined> {
         try {
             const tracking = (await this.executor.execute([
-                'rev-parse', '--abbrev-ref', `${branchName}@{upstream}`
+                'rev-parse', '--abbrev-ref', `@{upstream}`
             ])).trim();
             return tracking || undefined;
         } catch {
@@ -38,26 +40,7 @@ export class GitBranchService implements IBranchService {
         }
     }
 
-    async getAheadBehind(branchName: string): Promise<{ ahead: number; behind: number }> {
-        try {
-            const tracking = await this.getTrackingBranch(branchName);
-            if (!tracking) {
-                return { ahead: 0, behind: 0 };
-            }
-
-            const output = (await this.executor.execute([
-                'rev-list', '--left-right', '--count', `${branchName}...${tracking}`
-            ])).trim();
-
-            const parts = output.split(/\s+/);
-            return {
-                ahead: parseInt(parts[0], 10) || 0,
-                behind: parseInt(parts[1], 10) || 0
-            };
-        } catch {
-            return { ahead: 0, behind: 0 };
-        }
-    }
+    
 
     async getBranches(): Promise<GitBranch[]> {
         try {
@@ -87,7 +70,7 @@ export class GitBranchService implements IBranchService {
                 };
 
                 if (isCurrent && tracking) {
-                    const { ahead, behind } = await this.getAheadBehind(name.trim());
+                    const { ahead, behind } = await this.statusService.getAheadBehind();
                     branch.ahead = ahead;
                     branch.behind = behind;
                 }

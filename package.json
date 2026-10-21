@@ -14,6 +14,24 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
+     "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "aiGitAssistant",
+                    "title": "AI Git Assistant",
+                    "icon": "resources/ai-git-assistant.svg"
+                }
+            ]
+        },
+      "views": {
+        "aiGitAssistant": [
+          {
+            "id": "aiGitAssistant.overview",
+            "name": "AI Git Assistant",
+            "type": "webview"
+          }
+        ]
+      },
     "commands": [
       {
         "command": "ai-git-assistant.helloWorld",

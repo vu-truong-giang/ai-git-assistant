@@ -92,19 +92,4 @@ export class GitStatusService implements IStatusService {
             return { ahead: 0, behind: 0 };
         }   
     }
-    async getTrackingBranch(): Promise<string | null> {
-    try {
-        const stdout = await this.executor.execute([
-            'rev-parse',
-            '--abbrev-ref',
-            '--symbolic-full-name',
-            '@{upstream}'
-        ]);
-
-        return stdout.trim() || null;
-    } catch (error) {
-        console.error('Failed to get tracking branch', error);
-        return null;
-    }
-}
 }

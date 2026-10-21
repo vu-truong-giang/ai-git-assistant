@@ -6,5 +6,4 @@ export interface IStatusService {
     getUnstagedFiles(): Promise<GitFileStatus[]>;
     getUntrackedFiles(): Promise<GitFileStatus[]>;
     getAheadBehind(): Promise<GitAheadBehind>;
-    getTrackingBranch(): Promise<string | null>;
 }
