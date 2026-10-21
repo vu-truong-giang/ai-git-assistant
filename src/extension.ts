@@ -49,7 +49,7 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(workspaceCommand);
 
   if (wsPath) {
-    const executor = new GitCommandExecutor();
+    const executor = new GitCommandExecutor(wsPath);
     
     // Git Repository 
     const repositoryService: IGitRepositoryService = new GitRepositoryService(executor);
@@ -86,10 +86,6 @@ export function activate(context: vscode.ExtensionContext): void {
     const statusService = new GitStatusService(executor);
     const gitChangesWebviewProvider = new GitChangesWebviewProvider(context.extensionUri, statusService);
 
-    context.subscriptions.push(
-      vscode.window.registerWebviewViewProvider(GitChangesWebviewProvider.viewType, gitChangesWebviewProvider)
-    );
-
     // =========================
     // Git Diff
     // =========================
@@ -100,6 +96,10 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.workspace.registerTextDocumentContentProvider(GitDiffContentProvider.scheme, diffProvider)
     );
     
+    const openChangesCmd = vscode.commands.registerCommand('aiGitAssistant.openChanges', () => {
+      gitChangesWebviewProvider.open();
+    });
+
 		const refreshCmd = vscode.commands.registerCommand('aiGitAssistant.refreshChanges', () => {
       gitChangesWebviewProvider.updateHtml();
 		});
@@ -115,7 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		});
 
 
-		context.subscriptions.push(checkGitRepositoryCmd , refreshCmd, openDiffCmd);
+		context.subscriptions.push(checkGitRepositoryCmd, openChangesCmd, refreshCmd, openDiffCmd);
 	}
 
 }

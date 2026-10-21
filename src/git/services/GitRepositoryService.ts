@@ -1,5 +1,5 @@
 
-import { GitCommandExecutor } from './../executor/GitCommandExecutor'
+import { GitCommandExecutor } from './../executor/GitCommandExecutor';
 import {
     GitRepositoryInfo,
     IGitRepositoryService
@@ -9,15 +9,15 @@ import {
 export class GitRepositoryService implements IGitRepositoryService {
     constructor(
         private readonly executor: GitCommandExecutor
-    ){}
+    ) {}
     async checkRepository(
         workspacePath: string
     ): Promise<GitRepositoryInfo> {
         try {
             const result = await this.executor.execute(
-                ['rev-prase','--show-top-level'],
+                ['rev-parse', '--show-toplevel'],
                 workspacePath
-            )
+            );
             const repositoryRoot = result.trim();
             if (!repositoryRoot) {
                 return {
@@ -28,7 +28,8 @@ export class GitRepositoryService implements IGitRepositoryService {
                 isGitRepository: true,
                 repositoryRoot
             };
-        } catch {
+        } catch (error) {
+            console.error('Failed to check Git repository', error);
             return {
                 isGitRepository: false
             };

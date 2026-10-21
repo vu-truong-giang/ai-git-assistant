@@ -3,9 +3,9 @@ import * as cp from 'child_process';
 export class GitCommandExecutor {
     constructor(private workspaceRoot: string) {}
 
-    async execute(args: string[]): Promise<string> {
+    async execute(args: string[], cwd = this.workspaceRoot): Promise<string> {
         return new Promise((resolve, reject) => {
-            const process = cp.spawn('git', args, { cwd: this.workspaceRoot });
+            const process = cp.spawn('git', args, { cwd });
             let stdout = '';
             let stderr = '';
 

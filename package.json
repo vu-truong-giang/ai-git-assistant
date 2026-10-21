@@ -20,6 +20,10 @@
         "title": "AI Git Assistant: Hello World"
       },
       {
+        "command": "aiGitAssistant.openChanges",
+        "title": "AI Git Assistant: Open Git Changes"
+      },
+      {
         "command": "aiGitAssistant.refreshChanges",
         "title": "AI Git Assistant: Refresh Changes",
         "icon": "$(refresh)"
@@ -37,25 +41,6 @@
         "title": "AI Git Assistant: Check Git Repository"
       }
     ],
-    "views": {
-      "scm": [
-        {
-          "type": "webview",
-          "id": "aiGitAssistantChanges",
-          "name": "AI Git Changes Context",
-          "icon": "media/icon.svg"
-        }
-      ]
-    },
-    "menus": {
-      "view/title": [
-        {
-          "command": "aiGitAssistant.refreshChanges",
-          "when": "view == aiGitAssistantChanges",
-          "group": "navigation"
-        }
-      ]
-    },
     "configuration": {
       "title": "AI Git Assistant",
       "properties": {
