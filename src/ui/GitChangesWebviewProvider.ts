@@ -1,30 +1,41 @@
 import * as vscode from 'vscode';
-import { IStatusService } from '../git/interfaces/StatusService.interface';
+import { IStatusService } from '../git/interfaces/IGitStatusService';
 import { GitFileStatus } from '../git/models/GitFileStatus.model';
 
-export class GitChangesWebviewProvider implements vscode.WebviewViewProvider {
+export class GitChangesWebviewProvider {
     public static readonly viewType = 'aiGitAssistantChanges';
-    private _view?: vscode.WebviewView;
+    private _panel?: vscode.WebviewPanel;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _statusService: IStatusService
     ) { }
 
-    public resolveWebviewView(
-        webviewView: vscode.WebviewView
-    ) {
-        this._view = webviewView;
-        webviewView.webview.options = {
+    public open(): void {
+        if (this._panel) {
+            this._panel.reveal(vscode.ViewColumn.Active);
+            void this.updateHtml();
+            return;
+        }
+
+        this._panel = vscode.window.createWebviewPanel(
+            GitChangesWebviewProvider.viewType,
+            'AI Git Changes',
+            vscode.ViewColumn.Active,
+            {
             enableScripts: true,
             localResourceRoots: [this._extensionUri]
-        };
+            }
+        );
 
-        this.updateHtml();
+        this._panel.onDidDispose(() => {
+            this._panel = undefined;
+        });
+        void this.updateHtml();
     }
 
     public async updateHtml() {
-        if (!this._view) {
+        if (!this._panel) {
             return;
         }
 
@@ -32,7 +43,7 @@ export class GitChangesWebviewProvider implements vscode.WebviewViewProvider {
         const staged = allStatus.filter(f => f.staged);
         const unstaged = allStatus.filter(f => !f.staged);
 
-        this._view.webview.html = this.getHtmlForWebview(this._view.webview, staged, unstaged);
+        this._panel.webview.html = this.getHtmlForWebview(this._panel.webview, staged, unstaged);
     }
 
     private escapeHtml(text: string): string {

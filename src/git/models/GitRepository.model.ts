@@ -9,3 +9,7 @@ export interface GitRepository {
     commits: GitCommit[];
     remotes: GitRemote[];
 }
+export interface GitRepositoryInfo {
+    isGitRepository: boolean;
+    repositoryRoot?: string;
+}

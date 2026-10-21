@@ -2,7 +2,7 @@ import { IGitService } from './interfaces/IGitService.interface';
 import { IGitRepositoryService } from './interfaces/IGitRepositoryService';  
 import { IStatusService } from './interfaces/IGitStatusService';  
 import { IDiffService } from './interfaces/DiffService.interface';
-import { IBranchService } from './interfaces/BranchService.interface';
+import { IBranchService } from './interfaces/IGitBranchService';
 import { ICommitService } from './interfaces/CommitService.interface';
 import { IRemoteService } from './interfaces/RemoteService.interface';
 import { IConflictService } from './interfaces/ConflictService.interface';

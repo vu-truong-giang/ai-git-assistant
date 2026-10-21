@@ -6,5 +6,15 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   {
     ignores: ['dist/**', 'node_modules/**', 'out/**']
+  },
+  {
+    files: ['src/ui/webview/**/*.js'],
+    languageOptions: {
+      globals: {
+        acquireVsCodeApi: 'readonly',
+        document: 'readonly',
+        window: 'readonly'
+      }
+    }
   }
 );

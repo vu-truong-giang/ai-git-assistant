@@ -8,3 +8,7 @@ node_modules/
 .eslintrc*
 eslint.config.mjs
 tsconfig.json
+!src/
+!src/ui/
+!src/ui/webview/
+!src/ui/webview/**

@@ -14,10 +14,32 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
+     "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "aiGitAssistant",
+                    "title": "AI Git Assistant",
+                    "icon": "resources/ai-git-assistant.svg"
+                }
+            ]
+        },
+      "views": {
+        "aiGitAssistant": [
+          {
+            "id": "aiGitAssistant.overview",
+            "name": "AI Git Assistant",
+            "type": "webview"
+          }
+        ]
+      },
     "commands": [
       {
         "command": "ai-git-assistant.helloWorld",
         "title": "AI Git Assistant: Hello World"
+      },
+      {
+        "command": "aiGitAssistant.openChanges",
+        "title": "AI Git Assistant: Open Git Changes"
       },
       {
         "command": "aiGitAssistant.refreshChanges",
@@ -37,25 +59,6 @@
         "title": "AI Git Assistant: Check Git Repository"
       }
     ],
-    "views": {
-      "scm": [
-        {
-          "type": "webview",
-          "id": "aiGitAssistantChanges",
-          "name": "AI Git Changes Context",
-          "icon": "media/icon.svg"
-        }
-      ]
-    },
-    "menus": {
-      "view/title": [
-        {
-          "command": "aiGitAssistant.refreshChanges",
-          "when": "view == aiGitAssistantChanges",
-          "group": "navigation"
-        }
-      ]
-    },
     "configuration": {
       "title": "AI Git Assistant",
       "properties": {
