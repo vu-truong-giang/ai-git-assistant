@@ -5,7 +5,11 @@ export interface IRemoteService {
 
   fetch(remote?: string): Promise<GitRemote[]>;
 
-  pull(): Promise<GitRemote[]>;
+  pull(remote?: string, branch?: string): Promise<GitRemote[]>;
 
-  push(): Promise<GitRemote[]>;
+  push(
+    remote?: string,
+    branch?: string,
+    setUpstream?: boolean
+  ): Promise<GitRemote[]>;
 }

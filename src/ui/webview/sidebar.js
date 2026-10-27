@@ -51,6 +51,8 @@ content.addEventListener('click', event => {
         command: button.dataset.action,
         filePath: button.dataset.file,
         branch: button.dataset.branch,
+        remoteName: button.dataset.remoteName,
+        remoteBranch: button.dataset.remoteBranch,
         resolution: button.dataset.resolution,
         action: button.dataset.sync
     });
@@ -173,22 +175,22 @@ function renderBranches(branches) {
         <button class="primary-button wide create-branch" data-action="createBranch">＋ Create branch</button>
         <label class="field-label" for="branchFilter">Local and remote branches</label>
         <input class="filter-input" id="branchFilter" placeholder="⌕ Search branches..." />
-        <div class="branch-list">${branches.map(branch => `<div class="branch-row"><div class="branch-name-wrap"><strong>${branch.current ? '● ' : '⑂ '}${escapeHtml(branch.name)}</strong><small>${escapeHtml(branch.tracking || '')}</small></div>${branch.current ? '<span class="badge success">Current</span>' : `<button class="secondary-button" data-action="switchBranch" data-branch="${escapeAttr(branch.name)}">Checkout</button>`}</div>`).join('') || '<p class="muted">No branches found.</p>'}</div>
+        <div class="branch-list">${branches.map(branch => `<div class="branch-row"><div class="branch-name-wrap"><strong>${branch.current ? '● ' : '⑂ '}${escapeHtml(branch.name)}</strong><small>${escapeHtml(branch.tracking || (branch.isRemote ? 'Remote branch' : 'Local branch'))}</small></div><div class="branch-actions">${branch.current ? '<span class="badge success">Current</span>' : `<button class="secondary-button" data-action="switchBranch" data-branch="${escapeAttr(branch.name)}">Checkout</button><button class="text-button" data-action="mergeBranch" data-branch="${escapeAttr(branch.name)}">Merge</button>`}${branch.isRemote ? (branch.remoteName && branch.remoteBranch ? `<button class="text-button" data-action="deleteRemoteBranch" data-remote-name="${escapeAttr(branch.remoteName)}" data-remote-branch="${escapeAttr(branch.remoteBranch)}">Delete remote</button>` : '') : `<button class="text-button" data-action="renameBranch" data-branch="${escapeAttr(branch.name)}">Rename</button><button class="text-button" data-action="deleteBranch" data-branch="${escapeAttr(branch.name)}">Delete</button>`}</div></div>`).join('') || '<p class="muted">No branches found.</p>'}</div>
     </section>
     <section class="card"><h2>Branch status</h2><p class="muted">${repository.ahead ?? 0} ahead · ${repository.behind ?? 0} behind ${escapeHtml(repository.trackingBranch || 'upstream')}</p><button class="secondary-button wide" data-page-link="sync">Sync with remote</button></section>`;
 }
 
 function renderConflicts(conflicts) {
     if (!conflicts.length) {
-        return `<section class="card empty-state"><span class="empty-icon">✓</span><h2>No merge conflicts</h2><p class="muted">Your working tree has no unresolved merge conflicts.</p></section>`;
+        return `<section class="card empty-state"><span class="empty-icon">✓</span><h2>No merge conflicts</h2><p class="muted">Your working tree has no unresolved merge conflicts.</p>${repository.mergeInProgress ? '<button class="primary-button wide" data-action="continueMerge">Continue merge</button>' : ''}</section>`;
     }
-    return conflicts.map(conflict => `<section class="card conflict-card">
+    return `${conflicts.map(conflict => `<section class="card conflict-card">
         <div class="section-heading"><h2>Merge conflict</h2><span class="badge danger">Unresolved</span></div>
         <button class="file-link" data-action="openFile" data-file="${escapeAttr(conflict.filePath)}">${escapeHtml(conflict.filePath)}</button>
         <p class="muted">Choose a resolution or open the file to edit manually.</p>
-        <div class="quick-grid"><button class="secondary-button" data-action="resolveConflict" data-resolution="ours" data-file="${escapeAttr(conflict.filePath)}">Accept Current</button><button class="secondary-button" data-action="resolveConflict" data-resolution="theirs" data-file="${escapeAttr(conflict.filePath)}">Accept Incoming</button></div>
+        <div class="quick-grid"><button class="secondary-button" data-action="resolveConflict" data-resolution="ours" data-file="${escapeAttr(conflict.filePath)}">Accept Current</button><button class="secondary-button" data-action="resolveConflict" data-resolution="theirs" data-file="${escapeAttr(conflict.filePath)}">Accept Incoming</button><button class="secondary-button" data-action="resolveConflict" data-resolution="both" data-file="${escapeAttr(conflict.filePath)}">Accept Both</button><button class="secondary-button" data-action="markConflictResolved" data-file="${escapeAttr(conflict.filePath)}">Mark resolved</button></div>
         <button class="text-button" data-action="openFile" data-file="${escapeAttr(conflict.filePath)}">Open file</button>
-    </section>`).join('');
+    </section>`).join('')}${repository.mergeInProgress ? '<section class="card"><h2>Ready to finish?</h2><p class="muted">Resolve and stage all conflicted files before continuing the merge.</p><button class="primary-button wide" data-action="continueMerge">Continue merge</button></section>' : ''}`;
 }
 
 function renderHistory(history) {

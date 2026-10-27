@@ -3,21 +3,28 @@ import * as cp from 'child_process';
 export class GitCommandExecutor {
     constructor(private workspaceRoot: string) {}
 
-    async execute(args: string[], cwd = this.workspaceRoot): Promise<string> {
+    async execute(
+        args: string[],
+        cwd = this.workspaceRoot,
+        env?: NodeJS.ProcessEnv
+    ): Promise<string> {
         return new Promise((resolve, reject) => {
-            const process = cp.spawn('git', args, { cwd });
+            const childProcess = cp.spawn('git', args, {
+                cwd,
+                env: env ? { ...process.env, ...env } : process.env
+            });
             let stdout = '';
             let stderr = '';
 
-            process.stdout.on('data', (data: Buffer) => {
+            childProcess.stdout.on('data', (data: Buffer) => {
                 stdout += data.toString();
             });
 
-            process.stderr.on('data', (data: Buffer) => {
+            childProcess.stderr.on('data', (data: Buffer) => {
                 stderr += data.toString();
             });
 
-            process.on('close', (code: number | null) => {
+            childProcess.on('close', (code: number | null) => {
                 if (code === 0) {
                     resolve(stdout);
                 } else {
@@ -25,7 +32,7 @@ export class GitCommandExecutor {
                 }
             });
 
-            process.on('error', (err: Error) => {
+            childProcess.on('error', (err: Error) => {
                 reject(new Error(`Failed to spawn git command: ${err.message}`));
             });
         });

@@ -5,6 +5,9 @@ export interface IConflictService {
     hasConflicts(): Promise<boolean>;
 
     resolveConflict(
-        filePath: string, resolution: 'ours' | 'theirs'
+        filePath: string, resolution: 'ours' | 'theirs' | 'both'
     ): Promise<void>;
+    markConflictResolved(filePath: string): Promise<void>;
+    isMergeInProgress(): Promise<boolean>;
+    continueMerge(): Promise<void>;
 }
