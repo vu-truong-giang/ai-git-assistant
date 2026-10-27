@@ -5,4 +5,7 @@ export interface GitBranch {
   tracking?: string;
   ahead?: number;
   behind?: number;
+  isRemote?: boolean;
+  remoteName?: string;
+  remoteBranch?: string;
 }

@@ -13,8 +13,10 @@ interface SidebarMessage {
     filePath?: string;
     message?: string;
     branch?: string;
+    remoteName?: string;
+    remoteBranch?: string;
     action?: string;
-    resolution?: 'ours' | 'theirs';
+    resolution?: 'ours' | 'theirs' | 'both';
 }
 
 export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
@@ -68,14 +70,15 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
 
             await this.executor.execute(['rev-parse', '--is-inside-work-tree']);
             const [files, branch, trackingBranch, aheadBehind, branches,
-                remotes, conflicts] = await Promise.all([
+                remotes, conflicts, mergeInProgress] = await Promise.all([
                 this.statusService.getStatus(),
                 this.branchService.getCurrentBranch(),
                 this.branchService.getTrackingBranch(),
                 this.statusService.getAheadBehind(),
                 this.branchService.getBranches(),
                 this.remoteService.getRemotes(),
-                this.conflictService.getConflicts()
+                this.conflictService.getConflicts(),
+                this.conflictService.isMergeInProgress()
             ]);
 
             const historyOutput = await this.executor.execute([
@@ -109,6 +112,7 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                 branches,
                 remotes,
                 conflicts,
+                mergeInProgress,
                 history
             });
         } catch (error) {
@@ -161,9 +165,7 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                     const branchName = await vscode.window.showInputBox({
                         prompt: 'Nhập tên branch mới',
                         validateInput: value =>
-                            value.trim()
-                                ? undefined
-                                : 'Tên branch không được để trống.'
+                            this.branchService.validateBranchName(value)
                     });
                     if (!branchName) {
                         return;
@@ -176,6 +178,87 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                         await this.branchService.switchBranch(message.branch);
                     }
                     break;
+                case 'mergeBranch': {
+                    if (!message.branch) {
+                        throw new Error('Không tìm thấy source branch.');
+                    }
+                    const confirmation = await vscode.window.showWarningMessage(
+                        `Merge "${message.branch}" vào branch hiện tại?`,
+                        { modal: true },
+                        'Merge'
+                    );
+                    if (confirmation !== 'Merge') {
+                        return;
+                    }
+                    const result = await this.branchService.mergeBranch(
+                        message.branch
+                    );
+                    await this.refresh();
+                    if (result === 'conflicts') {
+                        void vscode.window.showWarningMessage(
+                            'Merge có conflict. Hãy giải quyết trong trang Conflict.'
+                        );
+                    } else {
+                        void vscode.window.showInformationMessage(
+                            `Đã merge "${message.branch}" thành công.`
+                        );
+                    }
+                    return;
+                }
+                case 'deleteBranch': {
+                    if (!message.branch) {
+                        throw new Error('Không tìm thấy branch cần xóa.');
+                    }
+                    const confirmation = await vscode.window.showWarningMessage(
+                        `Xóa local branch "${message.branch}"?`,
+                        { modal: true },
+                        'Delete'
+                    );
+                    if (confirmation !== 'Delete') {
+                        return;
+                    }
+                    await this.branchService.deleteBranch(message.branch);
+                    break;
+                }
+                case 'deleteRemoteBranch': {
+                    if (!message.remoteName || !message.remoteBranch) {
+                        throw new Error('Không xác định được remote branch.');
+                    }
+                    const fullName =
+                        `${message.remoteName}/${message.remoteBranch}`;
+                    const confirmation = await vscode.window.showWarningMessage(
+                        `Xóa remote branch "${fullName}" trên remote "${message.remoteName}"?`,
+                        { modal: true },
+                        'Delete'
+                    );
+                    if (confirmation !== 'Delete') {
+                        return;
+                    }
+                    await this.branchService.deleteRemoteBranch(
+                        message.remoteName,
+                        message.remoteBranch
+                    );
+                    break;
+                }
+                case 'renameBranch': {
+                    if (!message.branch) {
+                        throw new Error('Không tìm thấy branch cần đổi tên.');
+                    }
+                    const newName = await vscode.window.showInputBox({
+                        prompt: `Đổi tên branch "${message.branch}"`,
+                        value: message.branch,
+                        validateInput: value =>
+                            this.branchService.validateBranchName(value)
+                    });
+                    if (!newName?.trim()) {
+                        return;
+                    }
+                    await this.branchService.renameBranch(
+                        message.branch,
+                        newName.trim()
+                    );
+                    break;
+                }
                 case 'resolveConflict':
                     if (message.filePath && message.resolution) {
                         await this.conflictService.resolveConflict(
@@ -184,8 +267,23 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                         );
                     }
                     break;
+                case 'markConflictResolved':
+                    if (message.filePath) {
+                        await this.conflictService.markConflictResolved(
+                            message.filePath
+                        );
+                    }
+                    break;
+                case 'continueMerge':
+                    await this.conflictService.continueMerge();
+                    void vscode.window.showInformationMessage(
+                        'Merge completed successfully.'
+                    );
+                    break;
                 case 'sync':
-                    await this.sync(message.action);
+                    if (!await this.sync(message.action)) {
+                        return;
+                    }
                     break;
                 case 'openAiSettings':
                     await vscode.commands.executeCommand(
@@ -242,21 +340,91 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         return absolutePath;
     }
 
-    private async sync(action: string | undefined): Promise<void> {
+    private async sync(action: string | undefined): Promise<boolean> {
         switch (action) {
             case 'fetch':
                 await this.remoteService.fetch();
                 break;
-            case 'pull':
-                await this.remoteService.pull();
+            case 'pull': {
+                if (await this.branchService.getTrackingBranch()) {
+                    await this.remoteService.pull();
+                    break;
+                }
+                const target = await this.pickRemoteBranch();
+                if (!target) {
+                    return false;
+                }
+                await this.remoteService.pull(target.remote, target.branch);
                 break;
-            case 'push':
-                await this.remoteService.push();
+            }
+            case 'push': {
+                if (await this.branchService.getTrackingBranch()) {
+                    await this.remoteService.push();
+                    break;
+                }
+                const remotes = await this.remoteService.getRemotes();
+                if (remotes.length === 0) {
+                    throw new Error('Không có remote nào được cấu hình.');
+                }
+                const remote = await vscode.window.showQuickPick(
+                    remotes.map(item => item.name),
+                    { placeHolder: 'Chọn remote để push branch hiện tại' }
+                );
+                if (!remote) {
+                    return false;
+                }
+                const currentBranch = await this.branchService.getCurrentBranch();
+                await this.remoteService.push(
+                    remote,
+                    currentBranch.name,
+                    true
+                );
                 break;
+            }
             default:
                 throw new Error('Thao tác Sync không hợp lệ.');
         }
         void vscode.window.showInformationMessage(`${action} hoàn tất.`);
+        return true;
+    }
+
+    private async pickRemoteBranch(): Promise<{
+        remote: string;
+        branch: string;
+    } | undefined> {
+        const remotes = await this.remoteService.getRemotes();
+        if (remotes.length === 0) {
+            throw new Error('Không có remote nào được cấu hình.');
+        }
+        const remote = await vscode.window.showQuickPick(
+            remotes.map(item => item.name),
+            { placeHolder: 'Chọn remote để pull' }
+        );
+        if (!remote) {
+            return undefined;
+        }
+
+        const branches = (await this.branchService.getBranches())
+            .filter(branch =>
+                branch.isRemote &&
+                branch.remoteName === remote
+            )
+            .flatMap(branch =>
+                branch.remoteBranch ? [branch.remoteBranch] : []
+            );
+        const branch = branches.length
+            ? await vscode.window.showQuickPick(branches, {
+                placeHolder: `Chọn branch trên ${remote}`
+            })
+            : await vscode.window.showInputBox({
+                prompt: `Nhập branch trên ${remote}`,
+                validateInput: value =>
+                    value.trim() ? undefined : 'Branch name cannot be empty.'
+            });
+        if (!branch?.trim()) {
+            return undefined;
+        }
+        return { remote, branch: branch.trim() };
     }
 
     private postData(data: Record<string, unknown>): void {

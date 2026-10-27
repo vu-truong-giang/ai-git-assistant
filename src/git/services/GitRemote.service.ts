@@ -13,7 +13,7 @@ export class GitRemoteService implements IRemoteService {
             }
 
             const remoteMap = new Map<string, { fetchUrl: string; pushUrl: string }>();
-            const lines = stdout.split('\n');
+            const lines = stdout.split(/\r?\n/);
 
             for (const line of lines) {
                 if (line.trim().length === 0) continue;
@@ -48,7 +48,7 @@ export class GitRemoteService implements IRemoteService {
             return remotes;
         } catch (error) {
             console.error('Failed to get remotes', error);
-            return [];
+            throw error;
         }
     }
 
@@ -68,9 +68,21 @@ export class GitRemoteService implements IRemoteService {
         }
     }
 
-    async pull(): Promise<GitRemote[]> {
+    async pull(remote?: string, branch?: string): Promise<GitRemote[]> {
         try {
-            await this.executor.execute(['pull']);
+            const args = ['pull'];
+            if (remote || branch) {
+                if (!remote || !branch) {
+                    throw new Error('Both remote and branch are required for an explicit pull.');
+                }
+                args.push(remote, branch);
+            }
+            await this.executor.execute(args);
+            if (remote && branch) {
+                await this.executor.execute([
+                    'branch', `--set-upstream-to=${remote}/${branch}`
+                ]);
+            }
             return await this.getRemotes();
         } catch (error) {
             console.error('Failed to pull', error);
@@ -78,9 +90,23 @@ export class GitRemoteService implements IRemoteService {
         }
     }
 
-    async push(): Promise<GitRemote[]> {
+    async push(
+        remote?: string,
+        branch?: string,
+        setUpstream: boolean = false
+    ): Promise<GitRemote[]> {
         try {
-            await this.executor.execute(['push']);
+            const args = ['push'];
+            if (remote || branch) {
+                if (!remote || !branch) {
+                    throw new Error('Both remote and branch are required for an explicit push.');
+                }
+                if (setUpstream) {
+                    args.push('--set-upstream');
+                }
+                args.push(remote, branch);
+            }
+            await this.executor.execute(args);
             return await this.getRemotes();
         } catch (error) {
             console.error('Failed to push', error);

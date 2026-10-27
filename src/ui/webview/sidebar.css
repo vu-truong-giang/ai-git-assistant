@@ -504,11 +504,20 @@ form input {
 .branch-row,
 .remote-row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 7px;
     padding: 8px 0;
     border-bottom: 1px solid var(--border);
+}
+
+.branch-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 5px;
+    flex-shrink: 0;
 }
 
 .branch-name-wrap {

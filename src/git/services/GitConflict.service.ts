@@ -1,9 +1,14 @@
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { IConflictService } from '../interfaces/ConflictService.interface';
 import { GitConflict } from '../models/GitConflict.model';
 import { GitCommandExecutor } from '../executor/GitCommandExecutor';
 
 export class GitConflictService implements IConflictService {
-    constructor(private executor: GitCommandExecutor) {}
+    constructor(
+        private executor: GitCommandExecutor,
+        private workspaceRoot: string
+    ) {}
 
     async getConflicts(): Promise<GitConflict[]> {
         try {
@@ -25,7 +30,7 @@ export class GitConflictService implements IConflictService {
             return conflicts;
         } catch (error) {
             console.error('Failed to get conflicts', error);
-            return [];
+            throw error;
         }
     }
 
@@ -33,19 +38,128 @@ export class GitConflictService implements IConflictService {
         try {
             const stdout = await this.executor.execute(['diff', '--name-only', '--diff-filter=U']);
             return stdout.trim().length > 0;
+        } catch (error) {
+            console.error('Failed to check for conflicts', error);
+            throw error;
+        }
+    }
+
+    async resolveConflict(
+        filePath: string,
+        resolution: 'ours' | 'theirs' | 'both'
+    ): Promise<void> {
+        try {
+            const safePath = this.validateFilePath(filePath);
+            if (resolution === 'both') {
+                const absolutePath = path.resolve(this.workspaceRoot, safePath);
+                const contents = await fs.readFile(absolutePath, 'utf8');
+                const resolvedContents = this.acceptBoth(contents);
+                await fs.writeFile(absolutePath, resolvedContents, 'utf8');
+            } else {
+                await this.executor.execute([
+                    'checkout', `--${resolution}`, '--', safePath
+                ]);
+            }
+            await this.executor.execute(['add', '--', safePath]);
+        } catch (error) {
+            console.error(`Failed to resolve conflict for ${filePath}`, error);
+            throw error;
+        }
+    }
+
+    async markConflictResolved(filePath: string): Promise<void> {
+        const safePath = this.validateFilePath(filePath);
+        await this.executor.execute(['add', '--', safePath]);
+    }
+
+    async isMergeInProgress(): Promise<boolean> {
+        try {
+            await this.executor.execute(['rev-parse', '--verify', 'MERGE_HEAD']);
+            return true;
         } catch {
             return false;
         }
     }
 
-    async resolveConflict(filePath: string, resolution: 'ours' | 'theirs'): Promise<void> {
+    async continueMerge(): Promise<void> {
         try {
-            await this.executor.execute(['checkout', `--${resolution}`, '--', filePath]);
-            await this.executor.execute(['add', filePath]);
+            await this.executor.execute(
+                ['merge', '--continue'],
+                this.workspaceRoot,
+                { GIT_EDITOR: 'true' }
+            );
         } catch (error) {
-            console.error(`Failed to resolve conflict for ${filePath}`, error);
+            console.error('Failed to continue merge', error);
             throw error;
         }
+    }
+
+    private validateFilePath(filePath: string): string {
+        if (!filePath) {
+            throw new Error('A conflict file path is required.');
+        }
+        const absolutePath = path.resolve(this.workspaceRoot, filePath);
+        const relativePath = path.relative(this.workspaceRoot, absolutePath);
+        if (
+            relativePath === '..' ||
+            relativePath.startsWith(`..${path.sep}`) ||
+            path.isAbsolute(relativePath)
+        ) {
+            throw new Error('Conflict file path is outside the workspace.');
+        }
+        return relativePath.split(path.sep).join('/');
+    }
+
+    private acceptBoth(contents: string): string {
+        const lines = contents.split(/\r?\n/);
+        const lineEnding = contents.includes('\r\n') ? '\r\n' : '\n';
+        const output: string[] = [];
+        let ours: string[] = [];
+        let theirs: string[] = [];
+        let section: 'ours' | 'base' | 'theirs' | undefined;
+        let foundConflict = false;
+
+        for (const line of lines) {
+            if (line.startsWith('<<<<<<< ')) {
+                if (section) {
+                    throw new Error('Conflict markers are malformed or nested.');
+                }
+                section = 'ours';
+                ours = [];
+                theirs = [];
+                foundConflict = true;
+            } else if (line.startsWith('||||||| ')) {
+                if (section !== 'ours') {
+                    throw new Error('Conflict markers are malformed.');
+                }
+                section = 'base';
+            } else if (line === '=======') {
+                if (section !== 'ours' && section !== 'base') {
+                    throw new Error('Conflict markers are malformed.');
+                }
+                section = 'theirs';
+            } else if (line.startsWith('>>>>>>> ')) {
+                if (section !== 'theirs') {
+                    throw new Error('Conflict markers are malformed.');
+                }
+                output.push(...ours, ...theirs);
+                section = undefined;
+            } else if (section === 'ours') {
+                ours.push(line);
+            } else if (section === 'theirs') {
+                theirs.push(line);
+            } else if (!section) {
+                output.push(line);
+            }
+        }
+
+        if (section) {
+            throw new Error('Conflict markers are incomplete.');
+        }
+        if (!foundConflict) {
+            throw new Error('No merge conflict markers found in the file.');
+        }
+        return output.join(lineEnding);
     }
 
 

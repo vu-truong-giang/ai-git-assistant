@@ -110,7 +110,10 @@ export function activate(context: vscode.ExtensionContext): void {
     const statusService = new GitStatusService(executor);
     const branchService = new GitBranchService(executor, statusService);
     const commitService = new GitCommitService(executor);
-    const conflictService = new GitConflictService(executor);
+    const conflictService = new GitConflictService(
+        executor,
+        wsPath ?? context.extensionPath
+    );
     const remoteService = new GitRemoteService(executor);
 
     const sidebarProvider = new GitSidebarViewProvider(
