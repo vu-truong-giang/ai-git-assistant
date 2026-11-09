@@ -1,5 +1,5 @@
 import { IDiffService } from '../interfaces/DiffService.interface';
-import { GitDiff, GitDiffChange, GitDiffChangeType } from '../models/GitDiff.model';
+import { GitDiff, GitDiffChange, GitDiffChangeType, GitRawDiffOptions } from '../models/GitDiff.model';
 import { GitCommandExecutor } from '../executor/GitCommandExecutor';
 
 export class GitDiffService implements IDiffService {
@@ -58,6 +58,28 @@ export class GitDiffService implements IDiffService {
         }
     }
 
+
+    async getRawDiff(options: GitRawDiffOptions = {}): Promise<string> {
+        const args = [
+            'diff',
+            '--no-color',
+            '--no-ext-diff',
+            `--unified=${options.contextLines ?? 3}`
+        ];
+        if (options.staged) {
+            args.push('--staged');
+        } else if (options.range) {
+            if (options.range.startsWith('-')) {
+                throw new Error(`Invalid revision range: ${options.range}`);
+            }
+            args.push(options.range);
+        }
+        args.push('--');
+        if (options.filePath) {
+            args.push(options.filePath);
+        }
+        return this.executor.execute(args);
+    }
 
     private parseDiffOutput(output: string): GitDiff[] {
         const diffs: GitDiff[] = [];

@@ -14,24 +14,24 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
-     "viewsContainers": {
-            "activitybar": [
-                {
-                    "id": "aiGitAssistant",
-                    "title": "AI Git Assistant",
-                    "icon": "resources/ai-git-assistant.svg"
-                }
-            ]
-        },
-      "views": {
-        "aiGitAssistant": [
-          {
-            "id": "aiGitAssistant.overview",
-            "name": "AI Git Assistant",
-            "type": "webview"
-          }
-        ]
-      },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiGitAssistant",
+          "title": "AI Git Assistant",
+          "icon": "resources/ai-git-assistant.svg"
+        }
+      ]
+    },
+    "views": {
+      "aiGitAssistant": [
+        {
+          "id": "aiGitAssistant.overview",
+          "name": "AI Git Assistant",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "ai-git-assistant.helloWorld",
@@ -57,6 +57,70 @@
       {
         "command": "ai-git-assistant.checkGitRepository",
         "title": "AI Git Assistant: Check Git Repository"
+      },
+      {
+        "command": "aiGitAssistant.ai.setApiKey",
+        "title": "Set Gemini API Key",
+        "category": "AI Git Assistant",
+        "icon": "$(key)"
+      },
+      {
+        "command": "aiGitAssistant.ai.clearApiKey",
+        "title": "Remove Gemini API Key",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.testConnection",
+        "title": "Test AI Connection",
+        "category": "AI Git Assistant",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "aiGitAssistant.ai.selectModel",
+        "title": "Select AI Model",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.generateCommitMessage",
+        "title": "Generate Commit Message with AI",
+        "category": "AI Git Assistant",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "aiGitAssistant.ai.explainChanges",
+        "title": "AI: Explain Changes",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.explainStagedChanges",
+        "title": "AI: Explain Staged Changes",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.reviewChanges",
+        "title": "AI: Review Changes",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.openChat",
+        "title": "AI: Open Git Chat",
+        "category": "AI Git Assistant",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "aiGitAssistant.ai.summarizeHistory",
+        "title": "AI: Summarize Commit History",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.summarizeBranch",
+        "title": "AI: Summarize Current Branch",
+        "category": "AI Git Assistant"
+      },
+      {
+        "command": "aiGitAssistant.ai.resolveConflict",
+        "title": "AI: Suggest Merge Conflict Resolution",
+        "category": "AI Git Assistant"
       }
     ],
     "configuration": {
@@ -67,12 +131,112 @@
           "default": true,
           "description": "Enable AI features in AI Git Assistant."
         },
+        "aiGitAssistant.ai.provider": {
+          "type": "string",
+          "enum": [
+            "gemini"
+          ],
+          "enumDescriptions": [
+            "Google Gemini (REST API)"
+          ],
+          "default": "gemini",
+          "description": "AI provider. The API key is stored in VS Code SecretStorage (command: \"Set Gemini API Key\")."
+        },
         "aiGitAssistant.ai.model": {
           "type": "string",
-          "default": "gpt-5.6",
-          "description": "AI model used by AI Git Assistant."
+          "default": "gemini-flash-latest",
+          "markdownDescription": "Gemini model id, e.g. `gemini-flash-latest`, `gemini-2.5-flash`, `gemini-2.5-pro`. Use the **Select AI Model** command to pick from the models available to your key."
+        },
+        "aiGitAssistant.ai.timeoutSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "maximum": 600,
+          "description": "Maximum time to wait for an AI response."
+        },
+        "aiGitAssistant.ai.responseLanguage": {
+          "type": "string",
+          "default": "Vietnamese",
+          "enum": [
+            "Vietnamese",
+            "English"
+          ],
+          "description": "Language for explanations, code reviews, chat answers and summaries."
+        },
+        "aiGitAssistant.ai.commitMessageLanguage": {
+          "type": "string",
+          "default": "English",
+          "enum": [
+            "English",
+            "Vietnamese"
+          ],
+          "description": "Language of generated commit messages."
+        },
+        "aiGitAssistant.ai.commitMessageStyle": {
+          "type": "string",
+          "default": "conventional",
+          "enum": [
+            "conventional",
+            "simple"
+          ],
+          "enumDescriptions": [
+            "Conventional Commits: feat(scope): subject",
+            "Plain summary line without a type prefix"
+          ],
+          "description": "Format of generated commit messages."
+        },
+        "aiGitAssistant.ai.maxContextChars": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 2000,
+          "maximum": 500000,
+          "description": "Maximum number of diff characters sent to the AI. Larger diffs are truncated fairly across files."
+        },
+        "aiGitAssistant.ai.excludeFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "composer.lock",
+            "Cargo.lock",
+            "poetry.lock",
+            "Gemfile.lock",
+            "go.sum",
+            "*.min.js",
+            "*.min.css",
+            "*.map",
+            "dist/**",
+            "out/**",
+            "build/**",
+            "node_modules/**"
+          ],
+          "description": "Glob patterns of generated/lock files whose diff content is not sent to the AI (only a one-line note)."
+        },
+        "aiGitAssistant.ai.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mask API keys, tokens, passwords and private keys in diffs before sending them to the AI. Sensitive files (.env, *.pem, *.key, ...) are never sent."
         }
       }
+    },
+    "menus": {
+      "scm/title": [
+        {
+          "command": "aiGitAssistant.ai.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "aiGitAssistant.ai.generateCommitMessage",
+          "when": "workspaceFolderCount > 0"
+        }
+      ]
     }
   },
   "scripts": {
@@ -83,7 +247,9 @@
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch",
     "check-types": "tsc --noEmit",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "test:unit": "node scripts/run-unit-tests.js",
+    "test": "npm run check-types && npm run test:unit"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

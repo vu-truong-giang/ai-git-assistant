@@ -22,6 +22,40 @@ export class GitCommitService implements ICommitService {
     }
 
 
+    async getHistory(limit: number, range = 'HEAD'): Promise<GitCommit[]> {
+        if (range.startsWith('-')) {
+            throw new Error(`Invalid revision range: ${range}`);
+        }
+        const separator = '\x1f';
+        const format = ['%H', '%h', '%an', '%ae', '%cn', '%ce', '%aI', '%s']
+            .join('%x1f');
+
+        let stdout: string;
+        try {
+            stdout = await this.executor.execute([
+                'log', `-n${Math.max(1, Math.floor(limit))}`, `--format=${format}`, range, '--'
+            ]);
+        } catch (error) {
+            // A repository without commits has no history yet.
+            if (String(error).includes('does not have any commits yet')) {
+                return [];
+            }
+            throw error;
+        }
+
+        return stdout.split(/\r?\n/).filter(Boolean).map(line => {
+            const parts = line.split(separator);
+            return {
+                hash: parts[0],
+                shortHash: parts[1],
+                author: { name: parts[2], email: parts[3] },
+                commitor: { name: parts[4], email: parts[5] },
+                date: new Date(parts[6]),
+                message: parts[7] ?? ''
+            };
+        });
+    }
+
     private async getLastCommit(): Promise<GitCommit> {
         const separator = '|__|';
         const format = [

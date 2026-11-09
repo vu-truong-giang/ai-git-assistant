@@ -12,3 +12,5 @@ tsconfig.json
 !src/ui/
 !src/ui/webview/
 !src/ui/webview/**
+scripts/
+out/

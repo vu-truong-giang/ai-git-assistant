@@ -13,3 +13,12 @@ export interface GitDiff {
     additions: number;
     deletions: number;
 }
+
+export interface GitRawDiffOptions {
+    /** Diff the index against HEAD instead of the working tree against the index. */
+    staged?: boolean;
+    /** Revision range such as "main...HEAD". Ignored when staged is true. */
+    range?: string;
+    filePath?: string;
+    contextLines?: number;
+}

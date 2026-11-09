@@ -7,6 +7,7 @@ import { GitConflictService } from '../git/services/GitConflict.service';
 import { GitRemoteService } from '../git/services/GitRemote.service';
 import { GitStatusService } from '../git/services/GitStatus.service';
 import { IWorkspaceService } from '../workspace/IWorkspaceService.interface';
+import { AIController, AITask } from './AIController';
 
 interface SidebarMessage {
     command?: string;
@@ -17,12 +18,16 @@ interface SidebarMessage {
     remoteBranch?: string;
     action?: string;
     resolution?: 'ours' | 'theirs' | 'both';
+    scope?: string;
+    task?: string;
 }
 
 export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiGitAssistant.overview';
 
     private view?: vscode.WebviewView;
+    /** Page requested before the webview script was ready to receive messages. */
+    private pendingPage?: string;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -32,7 +37,8 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         private readonly branchService: GitBranchService,
         private readonly commitService: GitCommitService,
         private readonly conflictService: GitConflictService,
-        private readonly remoteService: GitRemoteService
+        private readonly remoteService: GitRemoteService,
+        private readonly ai?: AIController
     ) {}
 
     resolveWebviewView(view: vscode.WebviewView): void {
@@ -47,6 +53,12 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         view.webview.onDidReceiveMessage((message: SidebarMessage) => {
             void this.handleMessage(message);
         });
+        if (this.ai) {
+            const subscription = this.ai.onDidChangeState(state => {
+                void view.webview.postMessage({ command: 'aiState', state });
+            });
+            view.onDidDispose(() => subscription.dispose());
+        }
         void this.refresh();
     }
 
@@ -122,7 +134,12 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
     }
 
     showPage(page: string): void {
-        this.view?.webview.postMessage({ command: 'navigate', page });
+        this.pendingPage = page;
+        void this.view?.webview.postMessage({ command: 'navigate', page }).then(delivered => {
+            if (delivered) {
+                this.pendingPage = undefined;
+            }
+        });
     }
 
     private async handleMessage(message: SidebarMessage): Promise<void> {
@@ -149,18 +166,42 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                         return;
                     }
                     await this.commitService.commit(commitMessage);
+                    void this.view?.webview.postMessage({ command: 'commitDone' });
                     void vscode.window.showInformationMessage('Commit thành công.');
                     break;
                 }
-                case 'generateCommitMessage':
-                    void vscode.window.showInformationMessage(
-                        'AI chưa được kết nối. Hãy cấu hình AI provider trong Settings để tạo commit message.'
-                    );
-                    await vscode.commands.executeCommand(
-                        'workbench.action.openSettings',
-                        'aiGitAssistant.ai'
-                    );
+                case 'generateCommitMessage': {
+                    if (!this.ai) {
+                        void vscode.window.showWarningMessage('Mở một workspace Git để dùng AI.');
+                        return;
+                    }
+                    const generated = await this.ai.generateCommitMessage('staged');
+                    if (generated) {
+                        void this.view?.webview.postMessage({ command: 'commitMessage', message: generated });
+                    }
                     return;
+                }
+                case 'aiReady':
+                case 'copyText':
+                case 'aiExplainChanges':
+                case 'aiReviewChanges':
+                case 'aiChatSend':
+                case 'aiChatClear':
+                case 'aiCancel':
+                case 'aiSetApiKey':
+                case 'aiClearApiKey':
+                case 'aiTestConnection':
+                case 'aiSelectModel':
+                case 'aiSummarizeHistory':
+                case 'aiSummarizeBranch':
+                    await this.handleAiMessage(message);
+                    return;
+                case 'aiResolveConflict':
+                    if (!this.ai || !message.filePath
+                        || !await this.ai.suggestConflictResolution(message.filePath)) {
+                        return;
+                    }
+                    break;
                 case 'createBranch': {
                     const branchName = await vscode.window.showInputBox({
                         prompt: 'Nhập tên branch mới',
@@ -302,6 +343,58 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             void vscode.window.showErrorMessage(`Thao tác thất bại: ${detail}`);
+        }
+    }
+
+    private async handleAiMessage(message: SidebarMessage): Promise<void> {
+        if (message.command === 'aiReady' && this.pendingPage) {
+            void this.view?.webview.postMessage({ command: 'navigate', page: this.pendingPage });
+            this.pendingPage = undefined;
+        }
+        if (message.command === 'copyText') {
+            if (message.message?.trim()) {
+                await vscode.env.clipboard.writeText(message.message);
+                void vscode.window.showInformationMessage('Đã copy commit message.');
+            }
+            return;
+        }
+        if (!this.ai) {
+            if (message.command !== 'aiReady') {
+                void vscode.window.showWarningMessage('Mở một workspace Git để dùng AI.');
+            }
+            return;
+        }
+        const scope = message.scope === 'staged' || message.scope === 'all' ? message.scope : 'auto';
+        switch (message.command) {
+            case 'aiReady':
+                void this.view?.webview.postMessage({ command: 'aiState', state: this.ai.getState() });
+                return;
+            case 'aiExplainChanges':
+                return this.ai.explainChanges(scope);
+            case 'aiReviewChanges':
+                return this.ai.reviewChanges(scope);
+            case 'aiChatSend': {
+                const ok = await this.ai.chat(message.message ?? '');
+                void this.view?.webview.postMessage({ command: 'chatSent', ok });
+                return;
+            }
+            case 'aiChatClear':
+                return this.ai.clearChat();
+            case 'aiCancel':
+                this.ai.cancel(message.task as AITask | undefined);
+                return;
+            case 'aiSetApiKey':
+                return this.ai.setApiKey();
+            case 'aiClearApiKey':
+                return this.ai.clearApiKey();
+            case 'aiTestConnection':
+                return this.ai.testConnection();
+            case 'aiSelectModel':
+                return this.ai.selectModel();
+            case 'aiSummarizeHistory':
+                return this.ai.summarizeHistory();
+            case 'aiSummarizeBranch':
+                return this.ai.summarizeBranch();
         }
     }
 
