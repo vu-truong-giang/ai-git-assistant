@@ -115,6 +115,139 @@ export class AIService {
         }
     }
 
+    /**
+     * Generates an AI response incrementally.
+     * Preserves generate() for existing non-streaming features.
+     */
+    async generateStream(
+        messages: AIMessage[],
+        onChunk: (chunk: string) => void,
+        options: Omit<AIRequestOptions, 'model' | 'timeoutMs'> & { timeoutMs?: number } = {}
+    ): Promise<AIResponse> {
+        const settings = this.getSettings();
+
+        if (!settings.enabled) {
+            throw new AIError(
+                'DISABLED',
+                'AI features are turned off in settings.',
+                this.provider.id
+            );
+        }
+
+        if (!await this.provider.isConfigured()) {
+            throw new AIError(
+                'MISSING_API_KEY',
+                'No API key has been set.',
+                this.provider.id
+            );
+        }
+
+        if (!this.provider.generateStream) {
+            throw new AIError(
+                'PROVIDER_ERROR',
+                'This AI provider does not support streaming.',
+                this.provider.id
+            );
+        }
+
+        const model = this.model;
+        const promptChars = messages.reduce(
+            (sum, message) => sum + message.content.length,
+            0
+        );
+
+        for (let attempt = 0; ; attempt++) {
+            const started = Date.now();
+            let emittedChunk = false;
+            let callbackFailed = false;
+
+            try {
+                const response = await this.provider.generateStream(
+                    {
+                        messages,
+                        options: {
+                            ...options,
+                            model,
+                            timeoutMs: options.timeoutMs ?? settings.timeoutMs
+                        }
+                    },
+                    (chunk: string) => {
+                        try {
+                            if (chunk.length > 0) {
+                                emittedChunk = true;
+                            }
+
+                            onChunk(chunk);
+                        } catch (error) {
+                            callbackFailed = true;
+                            throw error;
+                        }
+                    }
+                );
+
+                const usage = response.usage
+                    ? `, tokens in/out ${response.usage.inputTokens}/${response.usage.outputTokens}`
+                    : '';
+
+                this.log(
+                    `[${this.provider.id}] ${response.model} STREAM OK in ${Date.now() - started} ms (prompt ${promptChars} chars${usage})`
+                );
+
+                return response;
+            } catch (error) {
+                // Do not convert errors thrown by the consumer's callback.
+                if (callbackFailed) {
+                    throw error;
+                }
+
+                const aiError = error instanceof AIError
+                    ? error
+                    : new AIError(
+                        'PROVIDER_ERROR',
+                        String(error),
+                        this.provider.id,
+                        undefined,
+                        error
+                    );
+
+                this.log(
+                    `[${this.provider.id}] ${model} STREAM failed after ${Date.now() - started} ms: ${aiError.code} ${aiError.message}`
+                );
+
+                const transient =
+                    aiError.isRetryable && aiError.code !== 'TIMEOUT';
+
+                // Never retry after sending partial content to the UI.
+                // Otherwise the user could receive duplicated chunks.
+                if (
+                    !transient ||
+                    emittedChunk ||
+                    attempt >= this.maxRetries ||
+                    options.signal?.aborted
+                ) {
+                    throw aiError;
+                }
+
+                const wait = this.retryDelayMs * 2 ** attempt;
+
+                this.log(
+                    `[${this.provider.id}] STREAM retrying in ${wait} ms (attempt ${attempt + 2}/${this.maxRetries + 1})`
+                );
+
+                try {
+                    await delay(wait, options.signal);
+                } catch {
+                    throw new AIError(
+                        'CANCELLED',
+                        'The request was cancelled.',
+                        this.provider.id
+                    );
+                }
+            }
+        }
+    }
+
+
     /** Sends a tiny prompt to verify the key, model and network all work. */
     async testConnection(signal?: AbortSignal): Promise<ConnectionTestResult> {
         const started = Date.now();

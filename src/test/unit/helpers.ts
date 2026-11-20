@@ -3,13 +3,43 @@ import { AIRequest } from '../../ai/models/AIRequest.model';
 import { AIResponse } from '../../ai/models/AIResponse.model';
 
 /** Provider that records requests and answers from a queue (string or Error). */
+
+/** Provider that records requests and answers from a queue (string or Error). */
 export class FakeProvider implements IAIProvider {
     readonly id = 'fake';
     readonly displayName = 'Fake AI';
     readonly defaultModel = 'fake-model';
     readonly requests: AIRequest[] = [];
 
-    constructor(private readonly answers: (string | Error)[], private configured = true) {}
+    generateStream?: (
+        request: AIRequest,
+        onChunk: (chunk: string) => void
+    ) => Promise<AIResponse>;
+
+    constructor(
+        private readonly answers: (string | Error)[],
+        private configured = true,
+        streamingSupported = true
+    ) {
+        if (streamingSupported) {
+            this.generateStream = async (request, onChunk) => {
+                const response = await this.generate(request);
+
+                // Split the answer into small chunks to simulate streaming.
+                const chunkSize = 4;
+
+                for (let i = 0; i < response.text.length; i += chunkSize) {
+                    if (request.options?.signal?.aborted) {
+                        throw new Error('FakeProvider: request aborted');
+                    }
+
+                    onChunk(response.text.slice(i, i + chunkSize));
+                }
+
+                return response;
+            };
+        }
+    }
 
     async isConfigured(): Promise<boolean> {
         return this.configured;
@@ -17,14 +47,22 @@ export class FakeProvider implements IAIProvider {
 
     async generate(request: AIRequest): Promise<AIResponse> {
         this.requests.push(request);
+
         const next = this.answers.shift();
+
         if (next === undefined) {
             throw new Error('FakeProvider: no more answers queued');
         }
+
         if (next instanceof Error) {
             throw next;
         }
-        return { text: next, model: request.options?.model ?? this.defaultModel, finishReason: 'stop' };
+
+        return {
+            text: next,
+            model: request.options?.model ?? this.defaultModel,
+            finishReason: 'stop'
+        };
     }
 }
 

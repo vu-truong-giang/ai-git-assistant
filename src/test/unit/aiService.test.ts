@@ -92,6 +92,183 @@ describe('AIService (TASK 7.3 / 7.5 / 7.6)', () => {
             assert.ok(text.length > 10, code);
         }
     });
+
+    it('streams chunks and returns the complete response', async () => {
+        const provider = new FakeProvider(['Hello world']);
+        const service = new AIService(provider, settings({ model: 'stream-model' }));
+        const chunks: string[] = [];
+
+        const response = await service.generateStream(
+            [{ role: 'user', content: 'Say hello' }],
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(response.text, 'Hello world');
+        assert.equal(response.model, 'stream-model');
+        assert.equal(chunks.join(''), response.text);
+        assert.ok(chunks.length > 1);
+        assert.equal(provider.requests[0].options?.model, 'stream-model');
+        assert.equal(provider.requests[0].options?.timeoutMs, 1000);
+    });
+
+    it('refuses streaming when AI is disabled', async () => {
+        const provider = new FakeProvider(['hello']);
+        const service = new AIService(provider, settings({ enabled: false }));
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'DISABLED'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+
+    it('refuses streaming without an API key', async () => {
+        const provider = new FakeProvider(['hello'], false);
+        const service = new AIService(provider, settings());
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'MISSING_API_KEY'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+
+    it('reports when provider does not support streaming', async () => {
+        const provider = new FakeProvider(['hello'], true, false);
+        const service = new AIService(provider, settings());
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'PROVIDER_ERROR'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+
+    it('retries network failures before emitting chunks', async () => {
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'connection lost', 'fake'),
+            'success'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 1
+        });
+        const chunks: string[] = [];
+
+        const response = await service.generateStream(
+            [{ role: 'user', content: 'x' }],
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(response.text, 'success');
+        assert.equal(chunks.join(''), 'success');
+        assert.equal(provider.requests.length, 2);
+    });
+
+    it('does not retry after chunks have been emitted', async () => {
+        const provider = new FakeProvider([
+            'first answer',
+            'second answer'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 2
+        });
+
+        await assert.rejects(
+            service.generateStream(
+                [{ role: 'user', content: 'x' }],
+                () => {
+                    throw new AIError('NETWORK', 'consumer stopped', 'fake');
+                }
+            ),
+            (error: AIError) => error.code === 'NETWORK'
+        );
+
+        assert.equal(provider.requests.length, 1);
+    });
+
+    it('does not retry streaming timeouts', async () => {
+        const provider = new FakeProvider([
+            new AIError('TIMEOUT', 'stream timeout', 'fake'),
+            'never'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 2
+        });
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'TIMEOUT'
+        );
+
+        assert.equal(provider.requests.length, 1);
+    });
+
+    it('does not retry streaming cancellation', async () => {
+        const provider = new FakeProvider([
+            new AIError('CANCELLED', 'cancelled', 'fake'),
+            'never'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 2
+        });
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'CANCELLED'
+        );
+
+        assert.equal(provider.requests.length, 1);
+    });
+
+    it('wraps unknown streaming provider errors', async () => {
+        const provider = new FakeProvider([new Error('stream failure')]);
+        const service = new AIService(provider, settings());
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: unknown) =>
+                error instanceof AIError && error.code === 'PROVIDER_ERROR'
+        );
+    });
+
+    it('passes AbortSignal to the streaming provider', async () => {
+        const provider = new FakeProvider(['hello']);
+        const service = new AIService(provider, settings());
+        const controller = new AbortController();
+
+        await service.generateStream(
+            [{ role: 'user', content: 'x' }],
+            () => undefined,
+            { signal: controller.signal }
+        );
+
+        assert.equal(
+            provider.requests[0].options?.signal,
+            controller.signal
+        );
+    });
+
+    it('passes custom timeout to the streaming provider', async () => {
+        const provider = new FakeProvider(['hello']);
+        const service = new AIService(provider, settings({ timeoutMs: 1000 }));
+
+        await service.generateStream(
+            [{ role: 'user', content: 'x' }],
+            () => undefined,
+            { timeoutMs: 5000 }
+        );
+
+        assert.equal(provider.requests[0].options?.timeoutMs, 5000);
+    });
+
 });
+
 
 
