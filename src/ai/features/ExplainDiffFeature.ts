@@ -1,6 +1,8 @@
+
 import { computeDiffStats, DiffStats } from '../context/diffUtils';
 import { GitContext, GitDiffScope } from '../context/GitContext.model';
 import { buildExplainDiffPrompt } from '../prompts/explainDiffPrompt';
+import { AIError } from '../models/AIError.model';
 import { AIFeatureDeps, contextRequest, FeatureUnavailableError } from './AIFeatureContext';
 
 export interface ExplainDiffResult {
@@ -22,8 +24,11 @@ export class ExplainDiffFeature {
 
         const contextStarted = Date.now();
 
+        // Truyền AbortSignal để người dùng có thể hủy cả quá trình
+        // thu thập Git context, không chỉ request gửi đến AI.
         const context = await this.deps.contextBuilder.build(
-            contextRequest(preferences, scope)
+            contextRequest(preferences, scope),
+            signal
         );
 
         const contextDuration = Date.now() - contextStarted;
@@ -31,6 +36,14 @@ export class ExplainDiffFeature {
         console.log(
             `[AI Explain Diff] Context built in ${contextDuration} ms`
         );
+
+        if (signal?.aborted) {
+            throw new AIError(
+                'CANCELLED',
+                'The explanation request was cancelled.',
+                this.deps.ai.providerId
+            );
+        }
 
         if (context.diff.files.length === 0) {
             throw new FeatureUnavailableError(
@@ -42,6 +55,7 @@ export class ExplainDiffFeature {
             context,
             preferences.responseLanguage
         );
+
         const promptChars = prompt.reduce(
             (sum, message) => sum + message.content.length,
             0
@@ -62,8 +76,19 @@ export class ExplainDiffFeature {
                 { temperature: 0.3, signal }
             );
 
+        const markdown = response.text.trim();
+
+        // Phòng trường hợp provider trả về response rỗng.
+        if (!markdown) {
+            throw new AIError(
+                'INVALID_RESPONSE',
+                'AI returned an empty explanation.',
+                this.deps.ai.providerId
+            );
+        }
+
         return {
-            markdown: response.text.trim(),
+            markdown,
             stats: computeDiffStats(context.diff.files),
             context
         };

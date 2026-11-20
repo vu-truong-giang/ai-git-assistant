@@ -33,11 +33,25 @@ export class AIResultPanel {
     ) {}
 
     showLoading(title: string, message: string): void {
-        this.render(title, `<div class="loading"><span class="spinner"></span><p>${escapeHtml(message)}</p></div>`, '');
+        this.isStreaming = false;
+        this.streamingMarkdown = '';
+
+        this.render(
+            title,
+            `<div class="loading"><span class="spinner"></span><p>${escapeHtml(message)}</p></div>`,
+            ''
+        );
     }
 
     showMarkdown(title: string, markdown: string, meta: PanelMeta = {}): void {
-        this.render(title, `${header(title, meta)}<article class="markdown">${renderMarkdown(markdown)}</article>`, markdown);
+        this.isStreaming = false;
+        this.streamingMarkdown = '';
+
+        this.render(
+            title,
+            `${header(title, meta)}<article class="markdown">${renderMarkdown(markdown)}</article>`,
+            markdown
+        );
     }
         /**
      * Starts a new streaming Markdown result.
@@ -75,6 +89,8 @@ export class AIResultPanel {
             return;
         }
 
+        this.isStreaming = false;
+
         void this.panel.webview.postMessage({
             command: 'streamComplete',
             html: renderMarkdown(this.streamingMarkdown)
@@ -91,9 +107,11 @@ export class AIResultPanel {
     }
     
     showStreamingError(message: string): void {
-        if (!this.panel) return;
+        if (!this.panel) {
+            return;
+        }
 
-        // Không cho phép copy kết quả Streaming chưa hoàn chỉnh.
+        this.isStreaming = false;
         this.copyText = '';
 
         void this.panel.webview.postMessage({

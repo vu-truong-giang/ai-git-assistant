@@ -25,6 +25,11 @@ export function createLinkedSignal(
 
     const timer = timeoutMs && timeoutMs > 0
         ? setTimeout(() => {
+            // Không ghi đè nguyên nhân nếu request đã bị hủy trước đó.
+            if (controller.signal.aborted) {
+                return;
+            }
+
             didTimeOut = true;
             controller.abort(new Error(`Timed out after ${timeoutMs} ms`));
         }, timeoutMs)
@@ -34,7 +39,7 @@ export function createLinkedSignal(
         signal: controller.signal,
         timedOut: () => didTimeOut,
         dispose: () => {
-            if (timer) {
+            if (timer !== undefined) {
                 clearTimeout(timer);
             }
             external?.removeEventListener('abort', onExternalAbort);

@@ -46,6 +46,22 @@ function sseResponseFromChunks(chunks: string[]): Response {
     });
 }
 
+function responseFailingOnAbort(
+    signal: AbortSignal | null | undefined,
+    error: Error
+): Response {
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+            signal?.addEventListener('abort', () => controller.error(error), { once: true });
+        }
+    });
+
+    return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+    });
+}
+
 
 describe('GeminiProvider (TASK 7.2)', () => {
     it('maps messages to Gemini format: system instruction, model role, merged turns, JSON mode', () => {
@@ -151,6 +167,34 @@ describe('GeminiProvider (TASK 7.2)', () => {
         });
         setTimeout(() => controller.abort(), 10);
         await expectAIError(pending, 'CANCELLED');
+    });
+
+    it('prefers timeout and cancellation over AI errors while reading responses', async () => {
+        const scenarios = [
+            { expected: 'TIMEOUT' as const, timeoutMs: 25, cancel: false },
+            { expected: 'CANCELLED' as const, timeoutMs: 5000, cancel: true }
+        ];
+
+        for (const scenario of scenarios) {
+            const controller = new AbortController();
+            const failure = new AIError('INVALID_RESPONSE', 'response read failed', 'gemini');
+            const stub = fakeFetch([
+                async init => responseFailingOnAbort(init.signal, failure)
+            ]);
+            const pending = new GeminiProvider(key, stub.fn).generate({
+                messages: [{ role: 'user', content: 'x' }],
+                options: {
+                    timeoutMs: scenario.timeoutMs,
+                    ...(scenario.cancel ? { signal: controller.signal } : {})
+                }
+            });
+
+            if (scenario.cancel) {
+                setTimeout(() => controller.abort(), 10);
+            }
+
+            await expectAIError(pending, scenario.expected);
+        }
     });
 
     it('detects blocked prompts and empty / truncated answers', async () => {
@@ -379,6 +423,37 @@ describe('GeminiProvider (TASK 7.2)', () => {
         setTimeout(() => controller.abort(), 10);
 
         await expectAIError(pending, 'CANCELLED');
+    });
+
+    it('prefers timeout and cancellation over AI errors while reading streaming responses', async () => {
+        const scenarios = [
+            { expected: 'TIMEOUT' as const, timeoutMs: 25, cancel: false },
+            { expected: 'CANCELLED' as const, timeoutMs: 5000, cancel: true }
+        ];
+
+        for (const scenario of scenarios) {
+            const controller = new AbortController();
+            const failure = new AIError('INVALID_RESPONSE', 'stream read failed', 'gemini');
+            const stub = fakeFetch([
+                async init => responseFailingOnAbort(init.signal, failure)
+            ]);
+            const pending = new GeminiProvider(key, stub.fn).generateStream(
+                {
+                    messages: [{ role: 'user', content: 'Hello' }],
+                    options: {
+                        timeoutMs: scenario.timeoutMs,
+                        ...(scenario.cancel ? { signal: controller.signal } : {})
+                    }
+                },
+                () => {}
+            );
+
+            if (scenario.cancel) {
+                setTimeout(() => controller.abort(), 10);
+            }
+
+            await expectAIError(pending, scenario.expected);
+        }
     });
 
 

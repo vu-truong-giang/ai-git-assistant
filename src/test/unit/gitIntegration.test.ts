@@ -20,7 +20,7 @@ import { GitCommitService } from '../../git/services/GitCommit.service';
 import { GitDiffService } from '../../git/services/GitDiff.service';
 import { GitStatusService } from '../../git/services/GitStatus.service';
 import { FakeProvider } from './helpers';
-
+import { AIError } from '../../ai/models/AIError.model';
 /**
  * End-to-end against a real temporary git repository:
  * EPIC 08 (context builder) with many kinds of diff (TASK 10.5),
@@ -171,6 +171,49 @@ describe('Git context + AI features on a real repository', () => {
         assert.match(provider.requests[0].messages[0].content, /Vietnamese/);
     });
 
+    it('EPIC 10: cancellation stops context collection before AI request', async () => {
+        const provider = new FakeProvider(['should not be generated']);
+        const controller = new AbortController();
+
+        controller.abort();
+
+        await assert.rejects(
+            new ExplainDiffFeature(deps(provider)).explain(
+                'all',
+                controller.signal
+            ),
+            (error: unknown) =>
+                error instanceof AIError && error.code === 'CANCELLED'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+    it('EPIC 10: streaming chunks match the final explanation', async () => {
+        const provider = new FakeProvider([
+            '## Summary\nAdded a new feature.'
+        ]);
+
+        const chunks: string[] = [];
+
+        const result = await new ExplainDiffFeature(deps(provider)).explain(
+            'all',
+            undefined,
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(chunks.join(''), result.markdown);
+        assert.ok(chunks.length > 0);
+    });
+    it('EPIC 10: rejects an empty AI explanation', async () => {
+        const provider = new FakeProvider(['   \n\t']);
+
+        await assert.rejects(
+            new ExplainDiffFeature(deps(provider)).explain('all'),
+            (error: unknown) =>
+                error instanceof AIError &&
+                error.code === 'INVALID_RESPONSE'
+        );
+    });
     it('EPIC 11: review asks for JSON with line numbers and parses issues', async () => {
         const provider = new FakeProvider([JSON.stringify({
             summary: 'Hard-coded key.',

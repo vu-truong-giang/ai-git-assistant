@@ -1,0 +1,1381 @@
+
+
+========== FILE: .\src\test\unit\aiService.test.ts ==========
+
+import { strict as assert } from 'node:assert';
+import { describe, it } from 'node:test';
+import { AIService, AIServiceSettings } from '../../ai/AIService';
+import { describeAIError } from '../../ai/errorMessages';
+import { AIError } from '../../ai/models/AIError.model';
+import { FakeProvider } from './helpers';
+
+const settings = (overrides: Partial<AIServiceSettings> = {}): (() => AIServiceSettings) =>
+    () => ({ enabled: true, model: '', timeoutMs: 1000, ...overrides });
+
+describe('AIService (TASK 7.3 / 7.5 / 7.6)', () => {
+    it('applies model and timeout from settings', async () => {
+        const provider = new FakeProvider(['ok']);
+        const service = new AIService(provider, settings({ model: 'my-model', timeoutMs: 1234 }));
+        const response = await service.generate([{ role: 'user', content: 'x' }], { temperature: 0.1 });
+        assert.equal(response.text, 'ok');
+        assert.equal(provider.requests[0].options?.model, 'my-model');
+        assert.equal(provider.requests[0].options?.timeoutMs, 1234);
+        assert.equal(provider.requests[0].options?.temperature, 0.1);
+    });
+
+    it('falls back to the provider default model when the setting is empty', () => {
+        assert.equal(new AIService(new FakeProvider([]), settings()).model, 'fake-model');
+    });
+
+    it('refuses to run when disabled or without a key', async () => {
+        await assert.rejects(
+            new AIService(new FakeProvider(['x']), settings({ enabled: false })).generate([{ role: 'user', content: 'x' }]),
+            (error: AIError) => error.code === 'DISABLED');
+        await assert.rejects(
+            new AIService(new FakeProvider(['x'], false), settings()).generate([{ role: 'user', content: 'x' }]),
+            (error: AIError) => error.code === 'MISSING_API_KEY');
+    });
+
+    it('retries rate limits and 5xx errors, then succeeds', async () => {
+        const provider = new FakeProvider([
+            new AIError('RATE_LIMITED', 'slow down', 'fake', 429),
+            new AIError('PROVIDER_ERROR', 'overloaded', 'fake', 503),
+            'finally'
+        ]);
+        const logs: string[] = [];
+        const service = new AIService(provider, settings(), { retryDelayMs: 1, log: line => logs.push(line) });
+        const response = await service.generate([{ role: 'user', content: 'x' }]);
+        assert.equal(response.text, 'finally');
+        assert.equal(provider.requests.length, 3);
+        assert.ok(logs.some(line => line.includes('retrying')));
+    });
+
+    it('does not retry invalid keys or timeouts', async () => {
+        for (const error of [
+            new AIError('INVALID_API_KEY', 'bad key', 'fake', 400),
+            new AIError('TIMEOUT', 'too slow', 'fake')
+        ]) {
+            const provider = new FakeProvider([error, 'never']);
+            const service = new AIService(provider, settings(), { retryDelayMs: 1 });
+            await assert.rejects(service.generate([{ role: 'user', content: 'x' }]), (e: AIError) => e.code === error.code);
+            assert.equal(provider.requests.length, 1);
+        }
+    });
+
+    it('gives up after maxRetries', async () => {
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'down', 'fake'),
+            new AIError('NETWORK', 'down', 'fake'),
+            new AIError('NETWORK', 'down', 'fake')
+        ]);
+        const service = new AIService(provider, settings(), { retryDelayMs: 1, maxRetries: 1 });
+        await assert.rejects(service.generate([{ role: 'user', content: 'x' }]), (e: AIError) => e.code === 'NETWORK');
+        assert.equal(provider.requests.length, 2);
+    });
+
+    it('wraps unknown provider errors into AIError', async () => {
+        const service = new AIService(new FakeProvider([new Error('boom')]), settings());
+        await assert.rejects(service.generate([{ role: 'user', content: 'x' }]),
+            (e: unknown) => e instanceof AIError && e.code === 'PROVIDER_ERROR');
+    });
+
+    it('testConnection reports provider, model, latency and reply', async () => {
+        const service = new AIService(new FakeProvider([' OK ']), settings({ model: 'm1' }));
+        const result = await service.testConnection();
+        assert.equal(result.provider, 'Fake AI');
+        assert.equal(result.model, 'm1');
+        assert.equal(result.reply, 'OK');
+        assert.ok(result.latencyMs >= 0);
+    });
+
+    it('has a Vietnamese message for every error code', () => {
+        const codes: AIError['code'][] = ['DISABLED', 'MISSING_API_KEY', 'INVALID_API_KEY', 'MODEL_NOT_FOUND',
+            'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'NETWORK', 'CONTENT_BLOCKED', 'INVALID_RESPONSE', 'PROVIDER_ERROR'];
+        for (const code of codes) {
+            const text = describeAIError(new AIError(code, 'detail', 'fake'));
+            assert.ok(text.length > 10, code);
+        }
+    });
+
+    it('streams chunks and returns the complete response', async () => {
+        const provider = new FakeProvider(['Hello world']);
+        const service = new AIService(provider, settings({ model: 'stream-model' }));
+        const chunks: string[] = [];
+
+        const response = await service.generateStream(
+            [{ role: 'user', content: 'Say hello' }],
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(response.text, 'Hello world');
+        assert.equal(response.model, 'stream-model');
+        assert.equal(chunks.join(''), response.text);
+        assert.ok(chunks.length > 1);
+        assert.equal(provider.requests[0].options?.model, 'stream-model');
+        assert.equal(provider.requests[0].options?.timeoutMs, 1000);
+    });
+
+    it('refuses streaming when AI is disabled', async () => {
+        const provider = new FakeProvider(['hello']);
+        const service = new AIService(provider, settings({ enabled: false }));
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'DISABLED'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+
+    it('refuses streaming without an API key', async () => {
+        const provider = new FakeProvider(['hello'], false);
+        const service = new AIService(provider, settings());
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'MISSING_API_KEY'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+
+    it('reports when provider does not support streaming', async () => {
+        const provider = new FakeProvider(['hello'], true, false);
+        const service = new AIService(provider, settings());
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'PROVIDER_ERROR'
+        );
+
+        assert.equal(provider.requests.length, 0);
+    });
+
+    it('retries network failures before emitting chunks', async () => {
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'connection lost', 'fake'),
+            'success'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 1
+        });
+        const chunks: string[] = [];
+
+        const response = await service.generateStream(
+            [{ role: 'user', content: 'x' }],
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(response.text, 'success');
+        assert.equal(chunks.join(''), 'success');
+        assert.equal(provider.requests.length, 2);
+    });
+
+    it('does not retry after chunks have been emitted', async () => {
+        const provider = new FakeProvider([
+            'first answer',
+            'second answer'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 2
+        });
+
+        await assert.rejects(
+            service.generateStream(
+                [{ role: 'user', content: 'x' }],
+                () => {
+                    throw new AIError('NETWORK', 'consumer stopped', 'fake');
+                }
+            ),
+            (error: AIError) => error.code === 'NETWORK'
+        );
+
+        assert.equal(provider.requests.length, 1);
+    });
+
+    it('does not retry streaming timeouts', async () => {
+        const provider = new FakeProvider([
+            new AIError('TIMEOUT', 'stream timeout', 'fake'),
+            'never'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 2
+        });
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'TIMEOUT'
+        );
+
+        assert.equal(provider.requests.length, 1);
+    });
+
+    it('does not retry streaming cancellation', async () => {
+        const provider = new FakeProvider([
+            new AIError('CANCELLED', 'cancelled', 'fake'),
+            'never'
+        ]);
+        const service = new AIService(provider, settings(), {
+            retryDelayMs: 1,
+            maxRetries: 2
+        });
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: AIError) => error.code === 'CANCELLED'
+        );
+
+        assert.equal(provider.requests.length, 1);
+    });
+
+    it('wraps unknown streaming provider errors', async () => {
+        const provider = new FakeProvider([new Error('stream failure')]);
+        const service = new AIService(provider, settings());
+
+        await assert.rejects(
+            service.generateStream([{ role: 'user', content: 'x' }], () => undefined),
+            (error: unknown) =>
+                error instanceof AIError && error.code === 'PROVIDER_ERROR'
+        );
+    });
+
+    it('passes AbortSignal to the streaming provider', async () => {
+        const provider = new FakeProvider(['hello']);
+        const service = new AIService(provider, settings());
+        const controller = new AbortController();
+
+        await service.generateStream(
+            [{ role: 'user', content: 'x' }],
+            () => undefined,
+            { signal: controller.signal }
+        );
+
+        assert.equal(
+            provider.requests[0].options?.signal,
+            controller.signal
+        );
+    });
+
+    it('passes custom timeout to the streaming provider', async () => {
+        const provider = new FakeProvider(['hello']);
+        const service = new AIService(provider, settings({ timeoutMs: 1000 }));
+
+        await service.generateStream(
+            [{ role: 'user', content: 'x' }],
+            () => undefined,
+            { timeoutMs: 5000 }
+        );
+
+        assert.equal(provider.requests[0].options?.timeoutMs, 5000);
+    });
+    
+    it('adds jitter to the retry delay', async () => {
+        const logs: string[] = [];
+
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'Temporary network error', 'fake'),
+            'success'
+        ]);
+
+        const service = new AIService(
+            provider,
+            settings(),
+            {
+                retryDelayMs: 2000,
+                retryJitterMs: 500,
+                random: () => 0.5,
+                log: line => logs.push(line)
+            }
+        );
+
+        const response = await service.generate([
+            { role: 'user', content: 'Hello' }
+        ]);
+
+        assert.equal(response.text, 'success');
+        assert.equal(provider.requests.length, 2);
+        assert.ok(logs.some(line => line.includes('2250 ms')));
+    });
+
+    it('uses exponential backoff without jitter when jitter is zero', async () => {
+        const logs: string[] = [];
+
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'Temporary network error', 'fake'),
+            'success'
+        ]);
+
+        const service = new AIService(
+            provider,
+            settings(),
+            {
+                retryDelayMs: 2000,
+                retryJitterMs: 0,
+                random: () => 0.5,
+                log: line => logs.push(line)
+            }
+        );
+
+        const response = await service.generate([
+            { role: 'user', content: 'Hello' }
+        ]);
+
+        assert.equal(response.text, 'success');
+        assert.equal(provider.requests.length, 2);
+        assert.ok(logs.some(line => line.includes('2000 ms')));
+    });
+
+});
+
+
+
+
+
+
+========== FILE: .\src\test\unit\context.test.ts ==========
+
+import { strict as assert } from 'node:assert';
+import { describe, it } from 'node:test';
+import { limitDiff, truncateLines } from '../../ai/context/ContextLimiter';
+import { annotateDiffWithLineNumbers, parseDiffSections, unquoteGitPath } from '../../ai/context/diffUtils';
+import { matchesGlob } from '../../ai/context/glob';
+import { redactSecrets } from '../../ai/context/SecretRedactor';
+
+function fileDiff(path: string, added: string[]): string {
+    return `diff --git a/${path} b/${path}
+index 1111111..2222222 100644
+--- a/${path}
++++ b/${path}
+@@ -1,1 +1,${added.length + 1} @@
+ context
+${added.map(line => `+${line}`).join('\n')}
+`;
+}
+
+describe('Diff parsing — many diff types (TASK 8.2 / 10.5)', () => {
+    const raw = [
+        'diff --git a/src/new.ts b/src/new.ts\nnew file mode 100644\nindex 0000000..abc\n--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1,2 @@\n+line1\n+line2\n',
+        'diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex abc..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n',
+        'diff --git a/a/name.ts b/b/name.ts\nsimilarity index 90%\nrename from a/name.ts\nrename to b/name.ts\nindex 1..2 100644\n--- a/a/name.ts\n+++ b/b/name.ts\n@@ -1 +1 @@\n-x\n+y\n',
+        'diff --git a/logo.png b/logo.png\nindex 1..2 100644\nBinary files a/logo.png and b/logo.png differ\n',
+        'diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n',
+        'diff --git "a/t\\303\\251st file.md" "b/t\\303\\251st file.md"\nindex 1..2 100644\n--- "a/t\\303\\251st file.md"\n+++ "b/t\\303\\251st file.md"\n@@ -1 +1,2 @@\n x\n+--- not a header\n'
+    ].join('');
+    const sections = parseDiffSections(raw);
+
+    it('splits one section per file', () => {
+        assert.deepEqual(sections.map(section => section.path),
+            ['src/new.ts', 'old.txt', 'b/name.ts', 'logo.png', 'run.sh', 'tést file.md']);
+    });
+
+    it('detects status, binary, mode change and line counts', () => {
+        const [added, deleted, renamed, binary, mode, unicode] = sections;
+        assert.equal(added.status, 'added');
+        assert.deepEqual([added.additions, added.deletions], [2, 0]);
+        assert.equal(deleted.status, 'deleted');
+        assert.deepEqual([deleted.additions, deleted.deletions], [0, 3]);
+        assert.equal(renamed.status, 'renamed');
+        assert.equal(renamed.oldPath, 'a/name.ts');
+        assert.equal(binary.binary, true);
+        assert.equal(mode.modeChanged, true);
+        // A "+--- ..." line inside a hunk is content, not a file header.
+        assert.deepEqual([unicode.additions, unicode.deletions], [1, 0]);
+    });
+
+    it('handles CRLF output', () => {
+        const crlf = fileDiff('win.txt', ['a', 'b']).replace(/\n/g, '\r\n');
+        const [section] = parseDiffSections(crlf);
+        assert.equal(section.path, 'win.txt');
+        assert.equal(section.additions, 2);
+    });
+
+    it('returns nothing for an empty diff', () => {
+        assert.deepEqual(parseDiffSections(''), []);
+    });
+
+    it('decodes quoted git paths', () => {
+        assert.equal(unquoteGitPath('"a/caf\\303\\251.txt"'), 'a/café.txt');
+        assert.equal(unquoteGitPath('plain.txt'), 'plain.txt');
+    });
+
+    it('annotates hunk lines with new-file line numbers (for code review)', () => {
+        const annotated = annotateDiffWithLineNumbers(
+            'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -10,3 +10,3 @@\n keep\n-old\n+new\n keep2\n');
+        // Marker column + 5-wide right-aligned number.
+        assert.match(annotated, /^ {4}10 \| keep$/m);
+        assert.match(annotated, /^- {6}\| old$/m);
+        assert.match(annotated, /^\+ {3}11 \| new$/m);
+        assert.match(annotated, /^ {4}12 \| keep2$/m);
+    });
+});
+
+describe('Context size limit (TASK 8.6)', () => {
+    it('keeps small diffs unchanged', () => {
+        const raw = fileDiff('a.ts', ['one', 'two']);
+        const limited = limitDiff(raw, { maxChars: 10_000, excludePatterns: [] });
+        assert.equal(limited.text, raw);
+        assert.deepEqual(limited.truncatedFiles, []);
+    });
+
+    it('shares the budget fairly: small files stay whole, the huge file is cut', () => {
+        const small1 = fileDiff('small1.ts', ['a']);
+        const small2 = fileDiff('small2.ts', ['b']);
+        const huge = fileDiff('huge.ts', Array.from({ length: 2000 }, (_, i) => `line ${i} ${'x'.repeat(40)}`));
+        const limited = limitDiff(small1 + huge + small2, { maxChars: 5000, excludePatterns: [] });
+
+        assert.ok(limited.text.includes(small1));
+        assert.ok(limited.text.includes(small2));
+        assert.deepEqual(limited.truncatedFiles, ['huge.ts']);
+        assert.ok(limited.text.length <= 5000 + 200, `length ${limited.text.length}`);
+        assert.match(limited.text, /\[truncated: \d+ more line\(s\) not shown\]/);
+        // Order of files is preserved.
+        assert.ok(limited.text.indexOf('small1.ts') < limited.text.indexOf('huge.ts'));
+        assert.ok(limited.text.indexOf('huge.ts') < limited.text.indexOf('small2.ts'));
+    });
+
+    it('replaces lock files, binaries and sensitive files with one-line notes', () => {
+        const raw = fileDiff('package-lock.json', ['"x": 1'])
+            + fileDiff('.env', ['DB_PASSWORD=hunter2hunter2'])
+            + fileDiff('config/server.pem', ['-----BEGIN PRIVATE KEY-----'])
+            + 'diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n'
+            + fileDiff('src/app.ts', ['ok']);
+        const limited = limitDiff(raw, { maxChars: 10_000, excludePatterns: ['package-lock.json'] });
+
+        assert.deepEqual(limited.omitted.map(item => `${item.path}:${item.reason}`), [
+            'package-lock.json:excluded', '.env:sensitive', 'config/server.pem:sensitive', 'img.png:binary'
+        ]);
+        assert.ok(!limited.text.includes('hunter2'));
+        assert.ok(!limited.text.includes('BEGIN PRIVATE KEY'));
+        assert.ok(limited.text.includes('+ok'));
+        assert.equal(limited.files.length, 5);
+    });
+
+    it('truncates at line boundaries', () => {
+        const text = 'aaaa\nbbbb\ncccc\ndddd\n';
+        const cut = truncateLines(text, 10);
+        assert.ok(cut.startsWith('aaaa\nbbbb\n'));
+        assert.match(cut, /truncated: 3 more line/);
+    });
+});
+
+describe('Secret redaction (EPIC 13 security)', () => {
+    it('masks well-known token formats', () => {
+        const samples = [
+            'AIzaSyA1234567890abcdefghijklmnopqrstuv',
+            'sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+            'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+            'AKIAABCDEFGHIJKLMNOP',
+            'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'
+        ];
+        for (const sample of samples) {
+            const result = redactSecrets(`const token = foo("${sample}");`);
+            assert.ok(!result.text.includes(sample), sample);
+            assert.ok(result.count >= 1, sample);
+        }
+    });
+
+    it('masks password-like assignments but keeps the key name', () => {
+        const result = redactSecrets('+  password: "SuperSecret123"\n+  apiKey = abcdef123456\n+ DB_PASSWORD=hunter2hunter2');
+        assert.ok(!result.text.includes('SuperSecret123'));
+        assert.ok(!result.text.includes('abcdef123456'));
+        assert.ok(!result.text.includes('hunter2hunter2'));
+        assert.ok(result.text.includes('password: "[REDACTED]"'));
+        assert.equal(result.count, 3);
+    });
+
+    it('masks private key blocks and URL credentials', () => {
+        const key = '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----';
+        assert.equal(redactSecrets(key).text, '[REDACTED]');
+        assert.equal(redactSecrets('postgres://admin:pa55word@db.local/app').text, 'postgres://[REDACTED]@db.local/app');
+    });
+
+    it('leaves normal code and env references alone', () => {
+        const code = 'const password = process.env.DB_PASSWORD;\nconst passwordLength = 12;\nif (token) { login(); }';
+        const result = redactSecrets(code);
+        assert.equal(result.text, code);
+        assert.equal(result.count, 0);
+    });
+});
+
+describe('Glob matching', () => {
+    it('matches basenames, folders and **', () => {
+        assert.ok(matchesGlob('a/b/package-lock.json', 'package-lock.json'));
+        assert.ok(matchesGlob('web/app.min.js', '*.min.js'));
+        assert.ok(matchesGlob('dist/x/y.js', 'dist/**'));
+        assert.ok(matchesGlob('src/deep/file.ts', 'src/**/*.ts'));
+        assert.ok(matchesGlob('.env.local', '.env.*'));
+        assert.ok(!matchesGlob('src/dist.ts', 'dist/**'));
+        assert.ok(!matchesGlob('environment.ts', '.env'));
+    });
+});
+
+
+
+========== FILE: .\src\test\unit\conflictAndMarkdown.test.ts ==========
+
+import { strict as assert } from 'node:assert';
+import { describe, it } from 'node:test';
+import { applyConflictResolutions, parseConflictFile } from '../../ai/features/conflictParser';
+import { renderMarkdown } from '../../ui/markdown';
+
+const CONFLICT = [
+    'import x from "x";',
+    '<<<<<<< HEAD',
+    'const port = 3000;',
+    '=======',
+    'const port = 8080;',
+    '>>>>>>> feature/port',
+    'start(port);',
+    '<<<<<<< HEAD',
+    'log("a");',
+    '||||||| base',
+    'log("base");',
+    '=======',
+    'log("b");',
+    '>>>>>>> feature/port',
+    ''
+].join('\r\n');
+
+describe('Merge conflict parsing (EPIC 13)', () => {
+    it('finds hunks, labels, base sections and context', () => {
+        const parsed = parseConflictFile(CONFLICT, 2);
+        assert.equal(parsed.eol, '\r\n');
+        assert.equal(parsed.hunks.length, 2);
+        const [first, second] = parsed.hunks;
+        assert.equal(first.oursLabel, 'HEAD');
+        assert.equal(first.theirsLabel, 'feature/port');
+        assert.equal(first.ours, 'const port = 3000;');
+        assert.equal(first.theirs, 'const port = 8080;');
+        assert.equal(first.base, undefined);
+        assert.equal(first.contextBefore, 'import x from "x";');
+        assert.equal(second.base, 'log("base");');
+        assert.equal(second.contextBefore, 'start(port);');
+    });
+
+    it('applies resolutions and keeps CRLF line endings', () => {
+        const parsed = parseConflictFile(CONFLICT);
+        const result = applyConflictResolutions(parsed, new Map([
+            [0, 'const port = process.env.PORT ?? 8080;'],
+            [1, 'log("a");\nlog("b");\n']
+        ]));
+        assert.equal(result, [
+            'import x from "x";',
+            'const port = process.env.PORT ?? 8080;',
+            'start(port);',
+            'log("a");',
+            'log("b");',
+            ''
+        ].join('\r\n'));
+    });
+
+    it('allows deleting a block and rejects bad resolutions', () => {
+        const parsed = parseConflictFile('a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\nz');
+        assert.equal(applyConflictResolutions(parsed, new Map([[0, '']])), 'a\nz');
+        assert.throws(() => applyConflictResolutions(parsed, new Map()), /Missing resolution/);
+        assert.throws(() => applyConflictResolutions(parsed, new Map([[0, '<<<<<<< HEAD\nx']])), /conflict markers/);
+    });
+
+    it('rejects unclosed conflicts', () => {
+        assert.throws(() => parseConflictFile('<<<<<<< HEAD\nx\n=======\ny\n'), /not closed/);
+    });
+});
+
+describe('Safe Markdown rendering of AI output', () => {
+    it('escapes HTML so AI output cannot inject markup', () => {
+        const html = renderMarkdown('<script>alert(1)</script>\n\n<img src=x onerror=alert(1)> **bold**');
+        assert.ok(!html.includes('<script>'));
+        assert.ok(!html.includes('<img'));
+        assert.ok(html.includes('&lt;script&gt;'));
+        assert.ok(html.includes('<strong>bold</strong>'));
+    });
+
+    it('only links http(s) URLs', () => {
+        assert.ok(renderMarkdown('[ok](https://example.com)').includes('<a href="https://example.com"'));
+        assert.ok(!renderMarkdown('[bad](javascript:alert(1))').includes('<a '));
+    });
+
+    it('renders headings, nested lists, code blocks and tables', () => {
+        const html = renderMarkdown([
+            '## Summary',
+            '- item **one**',
+            '  - nested `code`',
+            '1. first',
+            '',
+            '```bash',
+            'git reset --soft HEAD~1 <x>',
+            '```',
+            '| A | B |',
+            '|---|---|',
+            '| 1 | 2 |'
+        ].join('\n'));
+        assert.ok(html.includes('<h2>Summary</h2>'));
+        assert.ok(html.includes('<ul><li>item <strong>one</strong><ul><li>nested <code>code</code></li></ul></li></ul>'));
+        assert.ok(html.includes('<ol><li>first</li></ol>'));
+        assert.ok(html.includes('<pre data-lang="bash"><code>git reset --soft HEAD~1 &lt;x&gt;</code></pre>'));
+        assert.ok(html.includes('<th>A</th>') && html.includes('<td>2</td>'));
+    });
+
+    it('does not apply formatting inside inline code', () => {
+        assert.ok(renderMarkdown('use `a*b*c` here').includes('<code>a*b*c</code>'));
+    });
+});
+
+
+
+========== FILE: .\src\test\unit\geminiProvider.test.ts ==========
+
+import { strict as assert } from 'node:assert';
+import { describe, it } from 'node:test';
+import { AIError } from '../../ai/models/AIError.model';
+import { GeminiProvider } from '../../ai/providers/GeminiProvider';
+import { fakeFetch, geminiAnswer, json } from './helpers';
+
+const key = async () => 'AIza-test-key';
+
+async function expectAIError(promise: Promise<unknown>, code: AIError['code']): Promise<AIError> {
+    try {
+        await promise;
+    } catch (error) {
+        assert.ok(error instanceof AIError, `expected AIError, got ${String(error)}`);
+        assert.equal(error.code, code, error.message);
+        return error;
+    }
+    assert.fail(`expected AIError ${code}`);
+}
+
+function sseResponse(events: unknown[]): Response {
+    const data = events
+        .map(event => `data: ${JSON.stringify(event)}\n\n`)
+        .join('');
+
+    return new Response(data, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+    });
+}
+
+function sseResponseFromChunks(chunks: string[]): Response {
+    const encoder = new TextEncoder();
+
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const chunk of chunks) {
+                controller.enqueue(encoder.encode(chunk));
+            }
+            controller.close();
+        }
+    });
+
+    return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+    });
+}
+
+
+describe('GeminiProvider (TASK 7.2)', () => {
+    it('maps messages to Gemini format: system instruction, model role, merged turns, JSON mode', () => {
+        const provider = new GeminiProvider(key);
+        const body = provider.buildRequestBody({
+            messages: [
+                { role: 'system', content: 'rules A' },
+                { role: 'system', content: 'rules B' },
+                { role: 'user', content: 'q1' },
+                { role: 'assistant', content: 'a1' },
+                { role: 'user', content: 'q2' },
+                { role: 'user', content: 'q2 more' }
+            ],
+            options: { temperature: 0.2, responseFormat: 'json' }
+        });
+        assert.deepEqual(body, {
+            systemInstruction: { parts: [{ text: 'rules A\n\nrules B' }] },
+            contents: [
+                { role: 'user', parts: [{ text: 'q1' }] },
+                { role: 'model', parts: [{ text: 'a1' }] },
+                { role: 'user', parts: [{ text: 'q2' }, { text: 'q2 more' }] }
+            ],
+            generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
+        });
+    });
+
+    it('sends the key in a header (not the URL) and parses text, model and usage', async () => {
+        const stub = fakeFetch([geminiAnswer('Hello')]);
+        const provider = new GeminiProvider(key, stub.fn, 'https://example.test/v1beta');
+        const response = await provider.generate({
+            messages: [{ role: 'user', content: 'hi' }],
+            options: { model: 'gemini-x' }
+        });
+
+        assert.equal(response.text, 'Hello');
+        assert.equal(response.model, 'gemini-test-001');
+        assert.equal(response.finishReason, 'stop');
+        assert.deepEqual(response.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+        assert.equal(stub.calls[0].url, 'https://example.test/v1beta/models/gemini-x:generateContent');
+        assert.ok(!stub.calls[0].url.includes('AIza'));
+        assert.equal((stub.calls[0].init.headers as Record<string, string>)['x-goog-api-key'], 'AIza-test-key');
+    });
+
+    it('ignores "thought" parts of thinking models', async () => {
+        const stub = fakeFetch([json({
+            candidates: [{ content: { parts: [{ text: 'thinking...', thought: true }, { text: 'answer' }] }, finishReason: 'STOP' }]
+        })]);
+        const response = await new GeminiProvider(key, stub.fn).generate({ messages: [{ role: 'user', content: 'x' }] });
+        assert.equal(response.text, 'answer');
+    });
+
+    it('reports a missing key without calling the network', async () => {
+        const stub = fakeFetch([]);
+        const provider = new GeminiProvider(async () => undefined, stub.fn);
+        assert.equal(await provider.isConfigured(), false);
+        await expectAIError(provider.generate({ messages: [{ role: 'user', content: 'x' }] }), 'MISSING_API_KEY');
+        assert.equal(stub.calls.length, 0);
+    });
+
+    const httpCases: [number, unknown, AIError['code'], boolean][] = [
+        [400, { error: { code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT' } }, 'INVALID_API_KEY', false],
+        [403, { error: { code: 403, message: 'Permission denied', status: 'PERMISSION_DENIED' } }, 'INVALID_API_KEY', false],
+        [404, { error: { code: 404, message: 'models/foo is not found', status: 'NOT_FOUND' } }, 'MODEL_NOT_FOUND', false],
+        [429, { error: { code: 429, message: 'Quota exceeded', status: 'RESOURCE_EXHAUSTED' } }, 'RATE_LIMITED', true],
+        [503, { error: { code: 503, message: 'The model is overloaded', status: 'UNAVAILABLE' } }, 'PROVIDER_ERROR', true],
+        [400, { error: { code: 400, message: 'Invalid JSON payload', status: 'INVALID_ARGUMENT' } }, 'PROVIDER_ERROR', false]
+    ];
+    for (const [status, body, code, retryable] of httpCases) {
+        it(`maps HTTP ${status} to ${code} (TASK 7.5)`, async () => {
+            const stub = fakeFetch([json(body, status)]);
+            const error = await expectAIError(
+                new GeminiProvider(key, stub.fn).generate({ messages: [{ role: 'user', content: 'x' }] }), code);
+            assert.equal(error.statusCode, status);
+            assert.equal(error.isRetryable, retryable);
+        });
+    }
+
+    it('maps network failures to NETWORK', async () => {
+        const stub = fakeFetch([new TypeError('fetch failed')]);
+        await expectAIError(new GeminiProvider(key, stub.fn).generate({ messages: [{ role: 'user', content: 'x' }] }), 'NETWORK');
+    });
+
+    it('times out slow responses with TIMEOUT', async () => {
+        const hang = (init: RequestInit) => new Promise<Response>((_, reject) => {
+            init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const stub = fakeFetch([hang]);
+        await expectAIError(new GeminiProvider(key, stub.fn).generate({
+            messages: [{ role: 'user', content: 'x' }],
+            options: { timeoutMs: 30 }
+        }), 'TIMEOUT');
+    });
+
+    it('reports user cancellation as CANCELLED', async () => {
+        const hang = (init: RequestInit) => new Promise<Response>((_, reject) => {
+            init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const controller = new AbortController();
+        const stub = fakeFetch([hang]);
+        const pending = new GeminiProvider(key, stub.fn).generate({
+            messages: [{ role: 'user', content: 'x' }],
+            options: { signal: controller.signal, timeoutMs: 5000 }
+        });
+        setTimeout(() => controller.abort(), 10);
+        await expectAIError(pending, 'CANCELLED');
+    });
+
+    it('detects blocked prompts and empty / truncated answers', async () => {
+        const blocked = fakeFetch([json({ promptFeedback: { blockReason: 'SAFETY' } })]);
+        await expectAIError(new GeminiProvider(key, blocked.fn).generate({ messages: [{ role: 'user', content: 'x' }] }), 'CONTENT_BLOCKED');
+
+        const empty = fakeFetch([geminiAnswer('', 'MAX_TOKENS')]);
+        await expectAIError(new GeminiProvider(key, empty.fn).generate({ messages: [{ role: 'user', content: 'x' }] }), 'INVALID_RESPONSE');
+
+        const notJson = fakeFetch([new Response('<html>proxy error</html>', { status: 200 })]);
+        await expectAIError(new GeminiProvider(key, notJson.fn).generate({ messages: [{ role: 'user', content: 'x' }] }), 'INVALID_RESPONSE');
+    });
+
+
+    it('streams multiple chunks and returns the complete AIResponse', async () => {
+        const stub = fakeFetch([
+            sseResponse([
+                {
+                    candidates: [{
+                        content: { parts: [{ text: 'Hello ' }] }
+                    }]
+                },
+                {
+                    candidates: [{
+                        content: { parts: [{ text: 'World' }] },
+                        finishReason: 'STOP'
+                    }],
+                    modelVersion: 'gemini-test-001',
+                    usageMetadata: {
+                        promptTokenCount: 10,
+                        candidatesTokenCount: 5,
+                        totalTokenCount: 15
+                    }
+                }
+            ])
+        ]);
+
+        const provider = new GeminiProvider(
+            key,
+            stub.fn,
+            'https://example.test/v1beta'
+        );
+
+        const chunks: string[] = [];
+
+        const response = await provider.generateStream(
+            {
+                messages: [{ role: 'user', content: 'Say hello' }],
+                options: { model: 'gemini-x' }
+            },
+            chunk => chunks.push(chunk)
+        );
+
+        assert.deepEqual(chunks, ['Hello ', 'World']);
+        assert.equal(response.text, 'Hello World');
+        assert.equal(response.model, 'gemini-test-001');
+        assert.equal(response.finishReason, 'stop');
+
+        assert.deepEqual(response.usage, {
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15
+        });
+
+        assert.equal(
+            stub.calls[0].url,
+            'https://example.test/v1beta/models/gemini-x:streamGenerateContent?alt=sse'
+        );
+
+        const headers = stub.calls[0].init.headers as Record<string, string>;
+
+        assert.equal(headers['x-goog-api-key'], 'AIza-test-key');
+        assert.equal(headers['Accept'], 'text/event-stream');
+    });
+
+    
+    it('ignores thought parts while streaming', async () => {
+        const stub = fakeFetch([
+            sseResponse([
+                {
+                    candidates: [{
+                        content: {
+                            parts: [
+                                { text: 'Internal reasoning', thought: true },
+                                { text: 'Actual answer' }
+                            ]
+                        },
+                        finishReason: 'STOP'
+                    }]
+                }
+            ])
+        ]);
+
+        const chunks: string[] = [];
+
+        const response = await new GeminiProvider(key, stub.fn).generateStream(
+            { messages: [{ role: 'user', content: 'Explain this' }] },
+            chunk => chunks.push(chunk)
+        );
+
+        assert.deepEqual(chunks, ['Actual answer']);
+        assert.equal(response.text, 'Actual answer');
+    });
+
+
+    it('handles SSE data split across multiple network chunks', async () => {
+        const event = `data: ${JSON.stringify({
+            candidates: [{
+                content: { parts: [{ text: 'Split response' }] },
+                finishReason: 'STOP'
+            }]
+        })}\n\n`;
+
+        const splitAt = event.indexOf('"text"') + 4;
+
+        const stub = fakeFetch([
+            sseResponseFromChunks([
+                event.slice(0, splitAt),
+                event.slice(splitAt)
+            ])
+        ]);
+
+        const chunks: string[] = [];
+
+        const response = await new GeminiProvider(key, stub.fn).generateStream(
+            { messages: [{ role: 'user', content: 'Test splitting' }] },
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(response.text, 'Split response');
+        assert.deepEqual(chunks, ['Split response']);
+    });
+
+
+    it('rejects malformed SSE JSON with INVALID_RESPONSE', async () => {
+        const stub = fakeFetch([
+            new Response('data: {invalid-json}\n\n', {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            })
+        ]);
+
+        await expectAIError(
+            new GeminiProvider(key, stub.fn).generateStream(
+                { messages: [{ role: 'user', content: 'Test malformed SSE' }] },
+                () => {}
+            ),
+            'INVALID_RESPONSE'
+        );
+    });
+
+    
+    it('reports a missing API key for streaming without calling the network', async () => {
+        const stub = fakeFetch([]);
+
+        const provider = new GeminiProvider(
+            async () => undefined,
+            stub.fn
+        );
+
+        await expectAIError(
+            provider.generateStream(
+                { messages: [{ role: 'user', content: 'Hello' }] },
+                () => {}
+            ),
+            'MISSING_API_KEY'
+        );
+
+        assert.equal(stub.calls.length, 0);
+    });
+
+
+    
+    it('maps streaming HTTP 429 to RATE_LIMITED', async () => {
+        const stub = fakeFetch([
+            json({
+                error: {
+                    code: 429,
+                    message: 'Quota exceeded',
+                    status: 'RESOURCE_EXHAUSTED'
+                }
+            }, 429)
+        ]);
+
+        const error = await expectAIError(
+            new GeminiProvider(key, stub.fn).generateStream(
+                { messages: [{ role: 'user', content: 'Hello' }] },
+                () => {}
+            ),
+            'RATE_LIMITED'
+        );
+
+        assert.equal(error.statusCode, 429);
+    });
+
+    it('reports cancellation while reading the streaming response', async () => {
+        const hang = (init: RequestInit) => {
+            const body = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    init.signal?.addEventListener('abort', () => {
+                        controller.error(new DOMException('aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+
+            return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            }));
+        };
+
+        const controller = new AbortController();
+        const stub = fakeFetch([hang]);
+
+        const pending = new GeminiProvider(key, stub.fn).generateStream(
+            {
+                messages: [{ role: 'user', content: 'Hello' }],
+                options: {
+                    signal: controller.signal,
+                    timeoutMs: 5000
+                }
+            },
+            () => {}
+        );
+
+        setTimeout(() => controller.abort(), 10);
+
+        await expectAIError(pending, 'CANCELLED');
+    });
+
+
+    it('times out while reading the streaming response', async () => {
+        const hang = (init: RequestInit) => {
+            const body = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    init.signal?.addEventListener('abort', () => {
+                        controller.error(new DOMException('aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+
+            return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            }));
+        };
+
+        const stub = fakeFetch([hang]);
+
+        await expectAIError(
+            new GeminiProvider(key, stub.fn).generateStream(
+                {
+                    messages: [{ role: 'user', content: 'Hello' }],
+                    options: { timeoutMs: 30 }
+                },
+                () => {}
+            ),
+            'TIMEOUT'
+        );
+    });
+
+    
+
+    it('lists only Gemini models that support generateContent', async () => {
+        const stub = fakeFetch([json({
+            models: [
+                { name: 'models/gemini-b', supportedGenerationMethods: ['generateContent'] },
+                { name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] },
+                { name: 'models/gemini-a', supportedGenerationMethods: ['generateContent', 'countTokens'] }
+            ]
+        })]);
+        assert.deepEqual(await new GeminiProvider(key, stub.fn).listModels(), ['gemini-a', 'gemini-b']);
+    });
+});
+
+
+
+========== FILE: .\src\test\unit\gitIntegration.test.ts ==========
+
+import { strict as assert } from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { after, before, describe, it } from 'node:test';
+import { AIService } from '../../ai/AIService';
+import { DEFAULT_PREFERENCES } from '../../ai/AIPreferences';
+import { GitContextBuilder, formatGitContext } from '../../ai/context/GitContextBuilder';
+import { AIFeatureDeps, FeatureUnavailableError } from '../../ai/features/AIFeatureContext';
+import { CodeReviewFeature } from '../../ai/features/CodeReviewFeature';
+import { CommitMessageFeature } from '../../ai/features/CommitMessageFeature';
+import { ConflictAssistantFeature } from '../../ai/features/ConflictAssistantFeature';
+import { ExplainDiffFeature } from '../../ai/features/ExplainDiffFeature';
+import { GitChatSession } from '../../ai/features/GitChatSession';
+import { SummaryFeature } from '../../ai/features/SummaryFeature';
+import { GitCommandExecutor } from '../../git/executor/GitCommandExecutor';
+import { GitBranchService } from '../../git/services/GitBranch.service';
+import { GitCommitService } from '../../git/services/GitCommit.service';
+import { GitDiffService } from '../../git/services/GitDiff.service';
+import { GitStatusService } from '../../git/services/GitStatus.service';
+import { FakeProvider } from './helpers';
+
+/**
+ * End-to-end against a real temporary git repository:
+ * EPIC 08 (context builder) with many kinds of diff (TASK 10.5),
+ * and every AI feature wired to a fake provider.
+ */
+describe('Git context + AI features on a real repository', () => {
+    let repo: string;
+    let builder: GitContextBuilder;
+    let commits: GitCommitService;
+
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
+    const write = (file: string, content: string | Buffer) => {
+        fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+        fs.writeFileSync(path.join(repo, file), content);
+    };
+
+    function deps(provider: FakeProvider): AIFeatureDeps {
+        return {
+            ai: new AIService(provider, () => ({ enabled: true, model: '', timeoutMs: 5000 }), { retryDelayMs: 1 }),
+            contextBuilder: builder,
+            commits,
+            getPreferences: () => DEFAULT_PREFERENCES
+        };
+    }
+
+    before(() => {
+        repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-git-test-'));
+        git('init', '-q', '-b', 'main');
+        git('config', 'user.name', 'Test User');
+        git('config', 'user.email', 'test@example.com');
+        git('config', 'core.autocrlf', 'false');
+        git('config', 'commit.gpgsign', 'false');
+
+        write('src/app.ts', 'export function add(a: number, b: number) {\n    return a + b;\n}\n');
+        write('src/old-name.ts', 'export const value = 1;\nexport const other = 2;\nexport const third = 3;\n');
+        write('docs/remove-me.md', '# Old docs\n');
+        write('logo.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]));
+        write('package-lock.json', '{ "lockfileVersion": 3 }\n');
+        git('add', '-A');
+        git('commit', '-q', '-m', 'feat: initial project');
+
+        // Staged: modification + rename + deletion + binary change + lock file.
+        write('src/app.ts', 'export function add(a: number, b: number) {\n    if (Number.isNaN(a)) { throw new Error("NaN"); }\n    return a + b;\n}\n');
+        git('mv', 'src/old-name.ts', 'src/new-name.ts');
+        git('rm', '-q', 'docs/remove-me.md');
+        write('logo.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 9, 9, 9]));
+        write('package-lock.json', '{ "lockfileVersion": 3, "x": 1 }\n');
+        git('add', '-A');
+
+        // Unstaged change containing a secret, plus an untracked file.
+        write('src/config.ts', 'export const apiKey = "AIzaSyA1234567890abcdefghijklmnopqrstuv";\n');
+        git('add', 'src/config.ts');
+        git('commit', '-q', '-m', 'chore: add config');
+        write('src/config.ts', 'export const apiKey = "AIzaSyB0987654321zyxwvutsrqponmlkjihgfe";\n');
+        write('src/untracked.ts', 'export const fresh = true;\n');
+
+        const executor = new GitCommandExecutor(repo);
+        const status = new GitStatusService(executor);
+        commits = new GitCommitService(executor);
+        builder = new GitContextBuilder(status, new GitDiffService(executor), new GitBranchService(executor, status), commits, repo);
+    });
+
+    after(() => {
+        fs.rmSync(repo, { recursive: true, force: true });
+    });
+
+    it('TASK 8.1-8.4: collects status, branch and history', async () => {
+        const context = await builder.build({ diff: 'none', maxChars: 10_000, historyLimit: 10 });
+        assert.equal(context.branch, 'main');
+        assert.equal(context.diffScope, 'none');
+        assert.deepEqual(context.recentCommits.map(commit => commit.message), ['chore: add config', 'feat: initial project']);
+        assert.equal(context.recentCommits[0].author, 'Test User');
+        assert.ok(context.files.some(file => file.status === 'untracked' && file.filePath === 'src/untracked.ts'));
+    });
+
+    it('TASK 8.2 / 10.5: staged diff covers modify, rename, delete, binary and lock file', async () => {
+        // The secret-file change was committed, so "staged" is empty now; rebuild a staged set.
+        git('add', 'src/config.ts');
+        const context = await builder.build({ diff: 'staged', maxChars: 50_000 });
+        git('reset', '-q', 'src/config.ts');
+
+        const byPath = new Map(context.diff.files.map(file => [file.path, file]));
+        assert.equal(byPath.get('src/config.ts')?.status, 'modified');
+        assert.ok(context.diff.redactions >= 1, 'secret in diff must be redacted');
+        assert.ok(!context.diff.text.includes('AIzaSyB0987654321'));
+    });
+
+    it('TASK 8.5: "all" scope includes uncommitted + untracked content, formatted for the prompt', async () => {
+        const context = await builder.build({ diff: 'all', maxChars: 50_000, historyLimit: 5 });
+        const paths = context.diff.files.map(file => file.path);
+        assert.ok(paths.includes('src/config.ts'));
+        assert.ok(paths.includes('src/untracked.ts'));
+        assert.ok(context.diff.text.includes('+export const fresh = true;'));
+
+        const text = formatGitContext(context);
+        assert.match(text, /## Repository\nCurrent branch: main/);
+        assert.match(text, /## Recent commits/);
+        assert.match(text, /```diff/);
+        assert.match(text, /A {2}src\/untracked\.ts \(\+1 -0\)/);
+    });
+
+    it('TASK 10.5: rename/delete/binary/lock-file diff types between two commits', async () => {
+        // The second commit contains the modify/rename/delete/binary/lock-file/new-file changes made in before().
+        const full = await builder.build({ diff: { range: 'HEAD~1...HEAD' }, maxChars: 50_000 });
+        assert.equal(full.diffScope, 'range');
+        const byPath = new Map(full.diff.files.map(file => [file.path, file]));
+
+        assert.equal(byPath.get('src/app.ts')?.status, 'modified');
+        assert.deepEqual([byPath.get('src/app.ts')?.additions, byPath.get('src/app.ts')?.deletions], [1, 0]);
+        assert.equal(byPath.get('src/new-name.ts')?.status, 'renamed');
+        assert.equal(byPath.get('src/new-name.ts')?.oldPath, 'src/old-name.ts');
+        assert.equal(byPath.get('docs/remove-me.md')?.status, 'deleted');
+        assert.equal(byPath.get('src/config.ts')?.status, 'added');
+        assert.equal(byPath.get('logo.png')?.binary, true);
+        assert.ok(full.diff.omitted.some(item => item.path === 'package-lock.json' && item.reason === 'excluded'));
+        assert.ok(full.diff.omitted.some(item => item.path === 'logo.png' && item.reason === 'binary'));
+        assert.ok(!full.diff.text.includes('AIzaSyA1234567890'), 'committed secret is redacted too');
+    });
+
+    it('EPIC 09: generates a commit message from staged changes only', async () => {
+        git('add', 'src/untracked.ts');
+        const provider = new FakeProvider(['```\nfeat(src): add fresh flag.\n```']);
+        const result = await new CommitMessageFeature(deps(provider)).generate({ scope: 'staged' });
+        git('reset', '-q', 'src/untracked.ts');
+
+        assert.equal(result.message, 'feat(src): add fresh flag');
+        const prompt = provider.requests[0].messages.map(message => message.content).join('\n');
+        assert.match(prompt, /Conventional Commits/);
+        assert.match(prompt, /src\/untracked\.ts/);
+        assert.ok(!prompt.includes('src/config.ts'), 'unstaged files must not be in a staged commit prompt');
+        assert.ok(
+            !prompt.includes('chore: add config'),
+            'recent commit history must not be included in the V2 commit message prompt'
+        );    
+    });
+
+    it('EPIC 09: refuses when nothing is staged', async () => {
+        await assert.rejects(
+            new CommitMessageFeature(deps(new FakeProvider(['x']))).generate({ scope: 'staged' }),
+            FeatureUnavailableError);
+    });
+
+    it('EPIC 10: explains changes and returns local stats', async () => {
+        const provider = new FakeProvider(['## Tóm tắt\nThêm cờ fresh.']);
+        const result = await new ExplainDiffFeature(deps(provider)).explain('all');
+        assert.equal(result.markdown, '## Tóm tắt\nThêm cờ fresh.');
+        assert.equal(result.stats.files, 2);
+        assert.match(provider.requests[0].messages[0].content, /Vietnamese/);
+    });
+
+    it('EPIC 11: review asks for JSON with line numbers and parses issues', async () => {
+        const provider = new FakeProvider([JSON.stringify({
+            summary: 'Hard-coded key.',
+            score: 4,
+            issues: [{ severity: 'critical', category: 'security', file: 'src/config.ts', line: 1, title: 'Secret in code', description: 'd', suggestion: 'use env' }],
+            improvements: []
+        })]);
+        const result = await new CodeReviewFeature(deps(provider)).review('all');
+        assert.equal(result.issues[0].severity, 'critical');
+        assert.equal(provider.requests[0].options?.responseFormat, 'json');
+        assert.match(provider.requests[0].messages[1].content, /\+ {4}1 \| export const fresh = true;/);
+    });
+
+    it('EPIC 12: chat keeps history and injects fresh git context', async () => {
+        const provider = new FakeProvider(['Bạn đang ở branch main.', 'Có 2 file thay đổi.', new Error('network down')]);
+        const session = new GitChatSession(deps(provider));
+        await session.ask('Tôi đang ở branch nào?');
+        await session.ask('Có bao nhiêu file thay đổi?');
+        assert.equal(session.history.length, 4);
+
+        const second = provider.requests[1].messages;
+        assert.equal(second[0].role, 'system');
+        assert.match(second[0].content, /Current branch: main/);
+        assert.deepEqual(second.slice(1).map(message => message.role), ['user', 'assistant', 'user']);
+
+        await assert.rejects(session.ask('lỗi?'));
+        assert.equal(session.history.length, 4, 'a failed question is not stored');
+        session.clear();
+        assert.equal(session.history.length, 0);
+    });
+
+    it('EPIC 13: history and branch summaries', async () => {
+        git('stash', '-u', '-q');
+        git('checkout', '-q', '-b', 'feature/x');
+        write('src/feature.ts', 'export const feature = 1;\n');
+        git('add', '-A');
+        git('commit', '-q', '-m', 'feat: add feature');
+
+        const provider = new FakeProvider(['## Overview\nhistory', '## Purpose\nbranch']);
+        const summary = new SummaryFeature(deps(provider));
+        const history = await summary.summarizeHistory(10);
+        assert.match(history.title, /feature\/x \(3 commit\)/);
+
+        const branch = await summary.summarizeBranch('main');
+        assert.match(branch.title, /feature\/x so với main/);
+        const prompt = provider.requests[1].messages[1].content;
+        assert.match(prompt, /1 commit\(s\) ahead, 0 behind/);
+        assert.match(prompt, /src\/feature\.ts/);
+
+        await assert.rejects(summary.summarizeBranch('feature/x'), FeatureUnavailableError);
+        git('checkout', '-q', 'main');
+        git('stash', 'pop', '-q');
+    });
+
+    it('EPIC 13: conflict assistant merges hunks and refuses secrets', async () => {
+        const content = 'a\n<<<<<<< HEAD\nconst port = 3000;\n=======\nconst port = 8080;\n>>>>>>> feature\nb\n';
+        const provider = new FakeProvider([JSON.stringify({
+            resolutions: [{ index: 0, content: 'const port = Number(process.env.PORT ?? 8080);', explanation: 'giữ cả hai' }],
+            summary: 'ok'
+        })]);
+        const feature = new ConflictAssistantFeature(deps(provider));
+        const suggestion = await feature.suggest('src/server.ts', content);
+        assert.equal(suggestion.resolvedContent, 'a\nconst port = Number(process.env.PORT ?? 8080);\nb\n');
+        assert.equal(suggestion.explanations[0].explanation, 'giữ cả hai');
+
+        const secret = 'x\n<<<<<<< HEAD\npassword = "abcdef123456"\n=======\npassword = "zyxwvu654321"\n>>>>>>> f\n';
+        await assert.rejects(feature.suggest('a.ts', secret), FeatureUnavailableError);
+        await assert.rejects(feature.suggest('a.ts', 'no conflicts'), FeatureUnavailableError);
+    });
+});
+
+
+
+========== FILE: .\src\test\unit\parsers.test.ts ==========
+
+import { strict as assert } from 'node:assert';
+import { describe, it } from 'node:test';
+import { AIError } from '../../ai/models/AIError.model';
+import { parseCommitMessage } from '../../ai/parsers/commitMessageParser';
+import { extractJsonObject } from '../../ai/parsers/jsonResponse';
+import { parseReview } from '../../ai/parsers/reviewParser';
+
+describe('Commit message parsing (TASK 9.3)', () => {
+    it('keeps a clean message as is', () => {
+        assert.equal(parseCommitMessage('feat(auth): add login form'), 'feat(auth): add login form');
+    });
+
+    it('strips code fences, labels, quotes and trailing period', () => {
+        assert.equal(parseCommitMessage('```\nfix: handle null user.\n```'), 'fix: handle null user');
+        assert.equal(parseCommitMessage('Commit message: "docs: update README"'), 'docs: update README');
+        assert.equal(parseCommitMessage('**Commit message:** chore: bump deps'), 'chore: bump deps');
+    });
+
+    it('normalises the body: one blank line after the subject, no triple newlines', () => {
+        const parsed = parseCommitMessage('\n\nfeat: add chat\n- add panel\n\n\n\n- add history  \r\n');
+        assert.equal(parsed, 'feat: add chat\n\n- add panel\n\n- add history');
+    });
+
+    it('rejects an empty answer', () => {
+        assert.throws(() => parseCommitMessage('  ```\n```  '), (error: AIError) => error.code === 'INVALID_RESPONSE');
+    });
+});
+
+describe('JSON extraction', () => {
+    it('handles fences and surrounding text', () => {
+        assert.deepEqual(extractJsonObject('Here you go:\n```json\n{"a": 1}\n```'), { a: 1 });
+        assert.deepEqual(extractJsonObject('prefix {"b": [1,2]} suffix'), { b: [1, 2] });
+    });
+
+    it('fails clearly on non-JSON', () => {
+        assert.throws(() => extractJsonObject('no json here'), (error: AIError) => error.code === 'INVALID_RESPONSE');
+        assert.throws(() => extractJsonObject('{broken'), (error: AIError) => error.code === 'INVALID_RESPONSE');
+    });
+});
+
+describe('Code review parsing (EPIC 11)', () => {
+    it('normalises fields and sorts by severity', () => {
+        const review = parseReview(JSON.stringify({
+            summary: 'Mostly fine.',
+            score: 7.6,
+            issues: [
+                { severity: 'minor', category: 'code smell', file: 'b/src/a.ts', line: 12, title: 'Long function', description: 'd', suggestion: 's' },
+                { severity: 'CRITICAL', category: 'logic', file: 'src/b.ts', line: '40', title: 'Wrong condition' },
+                { severity: 'weird', category: 'unknown', file: 'src/c.ts', line: -3 },
+                'not an object'
+            ],
+            improvements: ['Add tests', '', 42]
+        }));
+
+        assert.equal(review.score, 8);
+        assert.deepEqual(review.issues.map(issue => issue.severity), ['critical', 'minor', 'minor']);
+        assert.equal(review.issues[0].line, 40);
+        assert.equal(review.issues[1].category, 'code-smell');
+        assert.equal(review.issues[1].file, 'src/a.ts');
+        assert.equal(review.issues[2].category, 'maintainability');
+        assert.equal(review.issues[2].line, null);
+        assert.equal(review.issues[2].title, 'Issue');
+        assert.deepEqual(review.improvements, ['Add tests', '42']);
+    });
+
+    it('accepts an empty review', () => {
+        const review = parseReview('{"summary":"Clean","issues":[]}');
+        assert.equal(review.issues.length, 0);
+        assert.equal(review.score, null);
+    });
+});
+

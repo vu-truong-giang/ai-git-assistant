@@ -1,0 +1,2756 @@
+
+
+
+========== src/ai/features/ExplainDiffFeature.ts ==========
+import { computeDiffStats, DiffStats } from '../context/diffUtils';
+import { GitContext, GitDiffScope } from '../context/GitContext.model';
+import { buildExplainDiffPrompt } from '../prompts/explainDiffPrompt';
+import { AIFeatureDeps, contextRequest, FeatureUnavailableError } from './AIFeatureContext';
+
+export interface ExplainDiffResult {
+    markdown: string;
+    stats: DiffStats;
+    context: GitContext;
+}
+
+/** EPIC 10: explains a diff in plain language. */
+export class ExplainDiffFeature {
+    constructor(private readonly deps: AIFeatureDeps) {}
+
+    async explain(
+        scope: GitDiffScope,
+        signal?: AbortSignal,
+        onChunk?: (chunk: string) => void
+    ): Promise<ExplainDiffResult> {
+        const preferences = this.deps.getPreferences();
+
+        const contextStarted = Date.now();
+
+        const context = await this.deps.contextBuilder.build(
+            contextRequest(preferences, scope)
+        );
+
+        const contextDuration = Date.now() - contextStarted;
+
+        console.log(
+            `[AI Explain Diff] Context built in ${contextDuration} ms`
+        );
+
+        if (context.diff.files.length === 0) {
+            throw new FeatureUnavailableError(
+                'Không có thay đổi nào để giải thích.'
+            );
+        }
+
+        const prompt = buildExplainDiffPrompt(
+            context,
+            preferences.responseLanguage
+        );
+        const promptChars = prompt.reduce(
+            (sum, message) => sum + message.content.length,
+            0
+        );
+
+        console.log(
+            `[AI Explain Diff] Prompt prepared: ${promptChars} characters`
+        );
+
+        const response = onChunk
+            ? await this.deps.ai.generateStream(
+                prompt,
+                onChunk,
+                { temperature: 0.3, signal }
+            )
+            : await this.deps.ai.generate(
+                prompt,
+                { temperature: 0.3, signal }
+            );
+
+        return {
+            markdown: response.text.trim(),
+            stats: computeDiffStats(context.diff.files),
+            context
+        };
+    }
+}
+
+
+
+========== src/ai/prompts/explainDiffPrompt.ts ==========
+import { AIMessage } from '../models/AIRequest.model';
+import { GitContext } from '../context/GitContext.model';
+import { formatGitContext } from '../context/GitContextBuilder';
+
+export function buildExplainDiffPrompt(context: GitContext, language: string): AIMessage[] {
+    const system = `You are a senior engineer explaining code changes to a teammate who has not seen them.
+Analyse the diff and answer in ${language}, as Markdown with exactly these sections (translate the section titles to ${language}):
+
+## Summary
+2-4 sentences: what the change does and its likely purpose. State the kind of change (feature, bug fix, refactor, docs, tests, config, ...).
+
+## Changes by file
+One bullet per file (or group of closely related files): what changed in it and why it matters. Mention renamed, added, deleted and binary files explicitly.
+
+## Impact & risks
+Behavioural impact, possible breaking changes, edge cases or follow-up work. Say clearly when there is no significant risk.
+
+Be concrete: refer to functions, classes and files by name. Do not invent changes that are not in the diff.
+If parts of the diff were truncated or omitted, say so briefly instead of guessing their content.`;
+
+    return [
+        { role: 'system', content: system },
+        { role: 'user', content: `Explain these changes.\n\n${formatGitContext(context, { status: false, history: false, diff: true })}` }
+    ];
+}
+
+
+
+========== src/ai/features/AIFeatureContext.ts ==========
+import { AIService } from '../AIService';
+import { AIPreferences } from '../AIPreferences';
+import { GitContextBuilder } from '../context/GitContextBuilder';
+import { GitContextRequest, GitDiffScope } from '../context/GitContext.model';
+import { ICommitService } from '../../git/interfaces/CommitService.interface';
+
+/** Shared dependencies of all AI features. */
+export interface AIFeatureDeps {
+    ai: AIService;
+    contextBuilder: GitContextBuilder;
+    commits: Pick<ICommitService, 'getHistory'>;
+    getPreferences: () => AIPreferences;
+}
+
+/** Thrown when a feature cannot run for a reason the user can fix (nothing staged, ...). */
+export class FeatureUnavailableError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'FeatureUnavailableError';
+    }
+}
+
+export function contextRequest(
+    preferences: AIPreferences,
+    diff: GitDiffScope,
+    extra: Partial<GitContextRequest> = {}
+): GitContextRequest {
+    return {
+        diff,
+        maxChars: preferences.maxContextChars,
+        excludePatterns: preferences.excludePatterns,
+        redactSecrets: preferences.redactSecrets,
+        ...extra
+    };
+}
+
+
+
+========== src/ai/context/GitContextBuilder.ts ==========
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { IDiffService } from '../../git/interfaces/DiffService.interface';
+import { ICommitService } from '../../git/interfaces/CommitService.interface';
+import { IBranchService } from '../../git/interfaces/IGitBranchService';
+import { IStatusService } from '../../git/interfaces/IGitStatusService';
+import { GitFileStatus } from '../../git/models/GitFileStatus.model';
+import { computeDiffStats, formatFileSummary } from './diffUtils';
+import { GitContext, GitContextCommit, GitContextRequest } from './GitContext.model';
+import { AIError } from '../models/AIError.model';
+import {
+    SENSITIVE_FILE_PATTERNS,
+    DEFAULT_EXCLUDE_PATTERNS,
+    limitDiff
+} from './ContextLimiter';
+import { matchesAnyGlob } from './glob';
+import { GitCommandOptions } from '../../git/executor/GitCommandExecutor';
+
+
+const MAX_UNTRACKED_FILES = 10;
+const MAX_UNTRACKED_FILE_BYTES = 16 * 1024;
+const MAX_UNTRACKED_TOTAL_BYTES = 128 * 1024;
+const GIT_DIFF_TIMEOUT_MS = 15_000;
+const MAX_GIT_DIFF_BYTES = 1_500_000;
+
+export type ReadWorkspaceFile = (relativePath: string) => Promise<Buffer | undefined>;
+
+/**
+ * Collects branch, status, diff and history from the Git services and turns them
+ * into a size-limited, secret-redacted context for AI prompts.
+ */
+export class GitContextBuilder {
+    private readonly readFile: ReadWorkspaceFile;
+
+    constructor(
+        private readonly status: IStatusService,
+        private readonly diff: IDiffService,
+        private readonly branch: Pick<IBranchService, 'getCurrentBranch'>,
+        private readonly commit: Pick<ICommitService, 'getHistory'>,
+        workspaceRoot: string,
+        readFile?: ReadWorkspaceFile
+    ) {
+        this.readFile = readFile ?? (relativePath => readInsideRoot(workspaceRoot, relativePath));
+    }
+
+    
+    async build(
+        request: GitContextRequest,
+        signal?: AbortSignal
+    ): Promise<GitContext> {
+        this.throwIfAborted(signal);
+
+        const contextStarted = Date.now();
+
+        try {
+            const [files, branchInfo, commits] = await Promise.all([
+                this.status.getStatus(),
+                this.branch.getCurrentBranch().catch(() => undefined),
+                request.historyLimit
+                    ? this.commit.getHistory(
+                        request.historyLimit,
+                        request.historyRange
+                    ).catch(() => [])
+                    : Promise.resolve([])
+            ]);
+
+            this.throwIfAborted(signal);
+
+            const { scope, range, rawDiff } = await this.collectDiff(
+                request,
+                files,
+                signal
+            );
+
+            this.throwIfAborted(signal);
+
+            const diff = limitDiff(rawDiff, {
+                maxChars: request.maxChars,
+                excludePatterns: request.excludePatterns,
+                redactSecrets: request.redactSecrets
+            });
+
+            const recentCommits: GitContextCommit[] = commits.map(commit => ({
+                shortHash: commit.shortHash,
+                message: commit.message,
+                author: commit.author.name,
+                date: isNaN(commit.date.getTime())
+                    ? ''
+                    : commit.date.toISOString().slice(0, 10)
+            }));
+
+            console.log(
+                `[GitContextBuilder] Built context in ${Date.now() - contextStarted} ms; ` +
+                `${rawDiff.length} raw chars, ${diff.text.length} context chars`
+            );
+
+            return {
+                branch: branchInfo?.name ?? 'HEAD',
+                trackingBranch: branchInfo?.tracking,
+                ahead: branchInfo?.ahead ?? 0,
+                behind: branchInfo?.behind ?? 0,
+                files,
+                diffScope: scope,
+                range,
+                diff,
+                recentCommits
+            };
+        } catch (error) {
+            if (signal?.aborted || isAbortError(error)) {
+                throw new AIError(
+                    'CANCELLED',
+                    'The Git context collection was cancelled.',
+                    'git',
+                    undefined,
+                    error
+                );
+            }
+
+            throw error;
+        }
+    }
+
+private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        throw new AIError(
+            'CANCELLED',
+            'The Git context collection was cancelled.',
+            'git'
+        );
+    }
+}
+
+
+    
+    private async collectDiff(
+        request: GitContextRequest,
+        files: GitFileStatus[],
+        signal?: AbortSignal
+    ): Promise<{
+        scope: GitContext['diffScope'];
+        range?: string;
+        rawDiff: string;
+    }> {
+        const requested = request.diff;
+
+        if (requested === 'none') {
+            return { scope: 'none', rawDiff: '' };
+        }
+
+        if (typeof requested === 'object') {
+            const rawDiff = await this.diff.getRawDiff(
+                { range: requested.range },
+                this.gitExecutionOptions(signal)
+            );
+
+            return {
+                scope: 'range',
+                range: requested.range,
+                rawDiff
+            };
+        }
+
+        const scope = requested === 'auto'
+            ? (files.some(file => file.staged) ? 'staged' : 'all')
+            : requested;
+
+        if (scope === 'staged') {
+            const rawDiff = await this.diff.getRawDiff(
+                { staged: true },
+                this.gitExecutionOptions(signal)
+            );
+
+            return { scope, rawDiff };
+        }
+
+        let tracked: string;
+
+        if (scope === 'working') {
+            tracked = await this.diff.getRawDiff(
+                {},
+                this.gitExecutionOptions(signal)
+            );
+        } else {
+            try {
+                // HEAD diff includes staged and unstaged tracked changes.
+                tracked = await this.diff.getRawDiff(
+                    { range: 'HEAD' },
+                    this.gitExecutionOptions(signal)
+                );
+            } catch (error) {
+                // Only fall back for a repository without its first commit.
+                // Never hide timeout, cancellation or output-limit errors.
+                if (!isUnbornHeadError(error)) {
+                    throw error;
+                }
+
+                const [staged, working] = await Promise.all([
+                    this.diff.getRawDiff(
+                        { staged: true },
+                        this.gitExecutionOptions(signal)
+                    ),
+                    this.diff.getRawDiff(
+                        {},
+                        this.gitExecutionOptions(signal)
+                    )
+                ]);
+
+                tracked = staged + working;
+            }
+        }
+
+        this.throwIfAborted(signal);
+
+        const untracked = await this.untrackedAsDiff(
+            files,
+            request.excludePatterns,
+            signal
+        );
+
+        return {
+            scope,
+            rawDiff: tracked + untracked
+        };
+    }
+
+private gitExecutionOptions(signal?: AbortSignal): GitCommandOptions {
+    return {
+        timeoutMs: GIT_DIFF_TIMEOUT_MS,
+        maxOutputBytes: MAX_GIT_DIFF_BYTES,
+        signal
+    };
+}
+
+
+    /** git diff ignores untracked files, so render them as "new file" diffs. */
+    
+    private async untrackedAsDiff(
+        files: GitFileStatus[],
+        customExcludePatterns?: readonly string[],
+        signal?: AbortSignal
+    ): Promise<string> {
+        const excluded = [
+            ...DEFAULT_EXCLUDE_PATTERNS,
+            ...(customExcludePatterns ?? [])
+        ];
+
+        const candidates = files
+            .filter(file => file.status === 'untracked')
+            .slice(0, MAX_UNTRACKED_FILES);
+
+        const blocks: string[] = [];
+        let remainingBytes = MAX_UNTRACKED_TOTAL_BYTES;
+
+        for (const file of candidates) {
+            this.throwIfAborted(signal);
+
+            const filePath = file.filePath.replace(/^"|"$/g, '');
+            const header =
+                `diff --git a/${filePath} b/${filePath}\n` +
+                'new file mode 100644\n';
+
+            if (
+                matchesAnyGlob(filePath, SENSITIVE_FILE_PATTERNS)
+            ) {
+                blocks.push(
+                    `${header}[content omitted: sensitive file]\n`
+                );
+                continue;
+            }
+
+            if (matchesAnyGlob(filePath, excluded)) {
+                blocks.push(
+                    `${header}[content omitted: generated/lock file]\n`
+                );
+                continue;
+            }
+
+            if (filePath.endsWith('/')) {
+                blocks.push(
+                    `${header}[untracked folder; contents not listed]\n`
+                );
+                continue;
+            }
+
+            if (remainingBytes <= 0) {
+                blocks.push(
+                    `${header}[content omitted: untracked context budget reached]\n`
+                );
+                continue;
+            }
+
+            let content: Buffer | undefined;
+
+            try {
+                content = await this.readFile(filePath);
+            } catch {
+                content = undefined;
+            }
+
+            this.throwIfAborted(signal);
+
+            if (!content) {
+                blocks.push(
+                    `${header}[untracked file could not be read]\n`
+                );
+                continue;
+            }
+
+            if (content.includes(0)) {
+                blocks.push(
+                    `${header}Binary files /dev/null and b/${filePath} differ\n`
+                );
+                continue;
+            }
+
+            const allowedBytes = Math.min(
+                MAX_UNTRACKED_FILE_BYTES,
+                remainingBytes
+            );
+
+            const truncated = content.length > allowedBytes;
+            const text = content
+                .subarray(0, allowedBytes)
+                .toString('utf8')
+                .replace(/\r\n/g, '\n');
+
+            remainingBytes -= Math.min(content.length, allowedBytes);
+
+            const lines = text.endsWith('\n')
+                ? text.slice(0, -1).split('\n')
+                : text.split('\n');
+
+            const cut = truncated
+                ? '\n... [untracked file truncated]\n'
+                : '';
+
+            blocks.push(
+                `${header}` +
+                `--- /dev/null\n` +
+                `+++ b/${filePath}\n` +
+                `@@ -0,0 +1,${lines.length} @@\n` +
+                `${lines.map(line => `+${line}`).join('\n')}` +
+                `${cut}\n`
+            );
+        }
+
+        return blocks.join('');
+    }
+
+}
+
+/** Renders the context as Markdown sections for a prompt. */
+export function formatGitContext(
+    context: GitContext,
+    include: { status?: boolean; history?: boolean; diff?: boolean } = { status: true, history: true, diff: true }
+): string {
+    const sections: string[] = [];
+    const tracking = context.trackingBranch
+        ? `, tracking ${context.trackingBranch} (ahead ${context.ahead}, behind ${context.behind})`
+        : ', no upstream';
+    sections.push(`## Repository\nCurrent branch: ${context.branch}${tracking}`);
+
+    if (include.status) {
+        const staged = context.files.filter(file => file.staged);
+        const unstaged = context.files.filter(file => !file.staged);
+        const list = (items: GitFileStatus[]) =>
+            items.map(file => `- ${file.status}: ${file.filePath}`).join('\n') || '- (none)';
+        sections.push(`## Working tree status\nStaged:\n${list(staged)}\nNot staged:\n${list(unstaged)}`);
+    }
+
+    if (include.history && context.recentCommits.length) {
+        sections.push(`## Recent commits (newest first)\n${context.recentCommits
+            .map(commit => `- ${commit.shortHash} ${commit.date} ${commit.author}: ${commit.message}`)
+            .join('\n')}`);
+    }
+
+    if (include.diff && context.diffScope !== 'none') {
+        const label = context.diffScope === 'range'
+            ? `changes in ${context.range}`
+            : `${context.diffScope} changes`;
+        const stats = computeDiffStats(context.diff.files);
+        const notes: string[] = [];
+        if (context.diff.truncatedFiles.length) {
+            notes.push(`Some files were truncated to fit the size limit: ${context.diff.truncatedFiles.join(', ')}.`);
+        }
+        if (context.diff.redactions) {
+            notes.push(`${context.diff.redactions} secret-looking value(s) were replaced with [REDACTED].`);
+        }
+        sections.push(
+            `## Changed files (${label}): ${stats.files} file(s), +${stats.additions} -${stats.deletions}\n` +
+            `${formatFileSummary(context.diff.files) || '(no changes)'}`
+        );
+        if (context.diff.text.trim()) {
+            sections.push(`## Diff\n${notes.map(note => `Note: ${note}`).join('\n')}${notes.length ? '\n' : ''}\`\`\`diff\n${context.diff.text.trimEnd()}\n\`\`\``);
+        }
+    }
+    return sections.join('\n\n');
+}
+
+
+async function readInsideRoot(
+    root: string,
+    relativePath: string
+): Promise<Buffer | undefined> {
+    const absolute = path.resolve(root, relativePath);
+
+    const realRoot = await fs.realpath(root);
+    const realFile = await fs.realpath(absolute);
+    const relative = path.relative(realRoot, realFile);
+
+    // Prevent both lexical traversal and symlink escape.
+    if (
+        relative.startsWith('..') ||
+        path.isAbsolute(relative)
+    ) {
+        return undefined;
+    }
+
+    const stat = await fs.stat(realFile);
+
+    if (!stat.isFile()) {
+        return undefined;
+    }
+
+    const handle = await fs.open(realFile, 'r');
+
+    try {
+        const buffer = Buffer.alloc(
+            Math.min(stat.size, MAX_UNTRACKED_FILE_BYTES + 1)
+        );
+
+        const { bytesRead } = await handle.read(
+            buffer,
+            0,
+            buffer.length,
+            0
+        );
+
+        return buffer.subarray(0, bytesRead);
+    } finally {
+        await handle.close();
+    }
+}
+
+function isAbortError(error: unknown): boolean {
+    return error instanceof Error && error.name === 'AbortError';
+}
+
+function isUnbornHeadError(error: unknown): boolean {
+    const message = error instanceof Error
+        ? error.message
+        : String(error);
+
+    return /ambiguous argument ['"]?HEAD|unknown revision|bad revision|needed a single revision|not a valid object name/i
+        .test(message);
+}
+
+
+
+
+========== src/ai/context/GitContext.model.ts ==========
+import { GitFileStatus } from '../../git/models/GitFileStatus.model';
+import { LimitedDiff } from './ContextLimiter';
+
+/**
+ * Which changes go into the diff:
+ *  - staged:  index vs HEAD (what the next commit contains)
+ *  - working: working tree vs index, plus untracked files
+ *  - all:     working tree vs HEAD, plus untracked files
+ *  - auto:    staged if anything is staged, otherwise all
+ *  - range:   a revision range such as "main...HEAD"
+ *  - none:    no diff (status/history only)
+ */
+export type GitDiffScope = 'staged' | 'working' | 'all' | 'auto' | 'none' | { range: string };
+
+export interface GitContextRequest {
+    diff: GitDiffScope;
+    /** Number of recent commits to include (0 = none). */
+    historyLimit?: number;
+    /** Range for the history, e.g. "main..HEAD". Defaults to HEAD. */
+    historyRange?: string;
+    /** Character budget for the diff part of the context. */
+    maxChars: number;
+    excludePatterns?: readonly string[];
+    redactSecrets?: boolean;
+}
+
+export interface GitContextCommit {
+    shortHash: string;
+    message: string;
+    author: string;
+    date: string;
+}
+
+export interface GitContext {
+    branch: string;
+    trackingBranch?: string;
+    ahead: number;
+    behind: number;
+    files: GitFileStatus[];
+    /** The scope that was actually used (auto resolved to staged/all). */
+    diffScope: 'staged' | 'working' | 'all' | 'range' | 'none';
+    range?: string;
+    diff: LimitedDiff;
+    recentCommits: GitContextCommit[];
+}
+
+
+
+========== src/ai/context/ContextLimiter.ts ==========
+import { DiffFileSection, parseDiffSections } from './diffUtils';
+import { matchesAnyGlob } from './glob';
+import { redactSecrets } from './SecretRedactor';
+
+/** Files whose content must never leave the machine. */
+export const SENSITIVE_FILE_PATTERNS: readonly string[] = [
+    '.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx', '*.jks', '*.keystore',
+    'id_rsa', 'id_rsa.*', 'id_ed25519', 'id_ed25519.*', '.npmrc', '.pypirc', '*.kdbx'
+];
+
+/** Generated / noisy files that waste the context budget. Overridable in settings. */
+export const DEFAULT_EXCLUDE_PATTERNS: readonly string[] = [
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'composer.lock', 'Cargo.lock',
+    'poetry.lock', 'Gemfile.lock', 'go.sum', '*.min.js', '*.min.css', '*.map',
+    'dist/**', 'out/**', 'build/**', 'node_modules/**'
+];
+
+export interface DiffLimitOptions {
+    maxChars: number;
+    excludePatterns?: readonly string[];
+    sensitivePatterns?: readonly string[];
+    redactSecrets?: boolean;
+}
+
+export type OmitReason = 'excluded' | 'sensitive' | 'binary';
+
+export interface LimitedDiff {
+    /** Diff text that fits in maxChars (plus short placeholders). */
+    text: string;
+    /** Every file in the original diff, for statistics. */
+    files: DiffFileSection[];
+    omitted: { path: string; reason: OmitReason }[];
+    truncatedFiles: string[];
+    redactions: number;
+    originalChars: number;
+}
+
+    
+/**
+ * Makes a diff safe and small enough to send to the AI:
+ *  1. drops sensitive files entirely and replaces lock/generated/binary files with a one-line note;
+ *  2. masks credentials;
+ *  3. splits the remaining budget fairly between files (small files stay whole,
+ *     big files are cut), so one huge file cannot crowd out all the others.
+ */
+
+export function limitDiff(rawDiff: string, options: DiffLimitOptions): LimitedDiff {
+    const files = parseDiffSections(rawDiff);
+    const omitted: LimitedDiff['omitted'] = [];
+    const truncatedFiles: string[] = [];
+    let redactions = 0;
+
+    const sensitive = options.sensitivePatterns ?? SENSITIVE_FILE_PATTERNS;
+    const excluded = options.excludePatterns ?? DEFAULT_EXCLUDE_PATTERNS;
+
+    const parts = files.map(file => {
+        const headerLine = file.text.split('\n', 1)[0];
+        const summary = `+${file.additions} -${file.deletions}`;
+
+        if (
+            matchesAnyGlob(file.path, sensitive) ||
+            (file.oldPath && matchesAnyGlob(file.oldPath, sensitive))
+        ) {
+            omitted.push({ path: file.path, reason: 'sensitive' });
+            return {
+                path: file.path,
+                flexible: false,
+                text: `${headerLine}\n[content omitted: sensitive file (${file.status})]\n`
+            };
+        }
+
+        if (matchesAnyGlob(file.path, excluded)) {
+            omitted.push({ path: file.path, reason: 'excluded' });
+            return {
+                path: file.path,
+                flexible: false,
+                text: `${headerLine}\n[content omitted: generated/lock file, ${summary}]\n`
+            };
+        }
+
+        if (file.binary) {
+            omitted.push({ path: file.path, reason: 'binary' });
+            return {
+                path: file.path,
+                flexible: false,
+                text: `${headerLine}\n[binary file ${file.status}]\n`
+            };
+        }
+
+        let text = file.text;
+
+        if (options.redactSecrets !== false) {
+            const result = redactSecrets(text);
+            text = result.text;
+            redactions += result.count;
+        }
+
+        return { path: file.path, flexible: true, text };
+    });
+
+    const budget = Math.max(0, Math.floor(options.maxChars));
+    let remaining = budget;
+    const output: string[] = [];
+
+    for (let index = 0; index < parts.length; index++) {
+        if (remaining <= 0) {
+            if (parts[index].flexible) {
+                truncatedFiles.push(parts[index].path);
+            }
+            continue;
+        }
+
+        const part = parts[index];
+        const remainingParts = parts.length - index;
+        const share = Math.min(
+            remaining,
+            Math.max(1, Math.floor(remaining / remainingParts))
+        );
+
+        let text = part.text;
+
+        if (text.length > share) {
+            text = truncateWithinBudget(text, share);
+            if (part.flexible) {
+                truncatedFiles.push(part.path);
+            }
+        }
+
+        output.push(text);
+        remaining -= text.length;
+    }
+
+    return {
+        text: output.join('').slice(0, budget),
+        files,
+        omitted,
+        truncatedFiles,
+        redactions,
+        originalChars: rawDiff.length
+    };
+}
+
+function truncateWithinBudget(text: string, maxChars: number): string {
+    if (maxChars <= 0) return '';
+    if (text.length <= maxChars) return text;
+
+    const lines = text.split('\n');
+    const kept: string[] = [];
+    let usedChars = 0;
+
+    for (const line of lines) {
+        const nextSize = line.length + (kept.length > 0 ? 1 : 0);
+
+        if (usedChars + nextSize > maxChars) {
+            break;
+        }
+
+        kept.push(line);
+        usedChars += nextSize;
+    }
+
+    const droppedLines = lines.length - kept.length;
+    const marker = `[truncated: ${droppedLines} more line(s) not shown]`;
+
+    while (kept.length > 0) {
+        const result = `${kept.join('\n')}\n${marker}`;
+        if (result.length <= maxChars) {
+            return result;
+        }
+        kept.pop();
+    }
+
+    return marker.slice(0, maxChars);
+}
+
+
+/** Truncates at a line boundary and says how much was cut. */
+export function truncateLines(text: string, maxChars: number): string {
+    if (text.length <= maxChars) {
+        return text;
+    }
+    const lines = text.split('\n');
+    const kept: string[] = [];
+    let size = 0;
+    for (const line of lines) {
+        if (size + line.length + 1 > maxChars && kept.length > 0) {
+            break;
+        }
+        kept.push(line.length > maxChars ? `${line.slice(0, maxChars)}…` : line);
+        size += line.length + 1;
+    }
+    const dropped = lines.length - kept.length;
+    return `${kept.join('\n')}\n... [truncated: ${dropped} more line(s) not shown]\n`;
+}
+
+/** Plain text (non-diff) limiter, e.g. for file content or commit lists. */
+export function limitText(text: string, maxChars: number): { text: string; truncated: boolean } {
+    if (text.length <= maxChars) {
+        return { text, truncated: false };
+    }
+    return { text: truncateLines(text, maxChars), truncated: true };
+}
+
+
+
+========== src/ai/context/diffUtils.ts ==========
+export type DiffFileStatus = 'added' | 'deleted' | 'renamed' | 'copied' | 'modified';
+
+export interface DiffFileSection {
+    path: string;
+    oldPath?: string;
+    status: DiffFileStatus;
+    binary: boolean;
+    modeChanged: boolean;
+    additions: number;
+    deletions: number;
+    /** The full "diff --git ..." block for this file. */
+    text: string;
+}
+
+export interface DiffStats {
+    files: number;
+    additions: number;
+    deletions: number;
+}
+
+/** Splits `git diff` output into one section per file and extracts metadata. */
+export function parseDiffSections(rawDiff: string): DiffFileSection[] {
+    const normalized = rawDiff.replace(/\r\n/g, '\n');
+    return normalized
+        .split(/^(?=diff --git )/m)
+        .filter(block => block.startsWith('diff --git '))
+        .map(parseSection);
+}
+
+function parseSection(text: string): DiffFileSection {
+    const lines = text.split('\n');
+    const header = parseHeaderPaths(lines[0].slice('diff --git '.length));
+    let oldPath = header?.oldPath;
+    let newPath = header?.newPath;
+    let status: DiffFileStatus = 'modified';
+    let binary = false;
+    let modeChanged = false;
+    let additions = 0;
+    let deletions = 0;
+    let inHunk = false;
+
+    for (const line of lines.slice(1)) {
+        if (line.startsWith('@@')) {
+            inHunk = true;
+            continue;
+        }
+        if (inHunk) {
+            if (line.startsWith('+')) {
+                additions++;
+            } else if (line.startsWith('-')) {
+                deletions++;
+            }
+            continue;
+        }
+        if (line.startsWith('new file mode')) {
+            status = 'added';
+        } else if (line.startsWith('deleted file mode')) {
+            status = 'deleted';
+        } else if (line.startsWith('rename from ')) {
+            status = 'renamed';
+            oldPath = unquoteGitPath(line.slice('rename from '.length));
+        } else if (line.startsWith('rename to ')) {
+            newPath = unquoteGitPath(line.slice('rename to '.length));
+        } else if (line.startsWith('copy from ')) {
+            status = 'copied';
+            oldPath = unquoteGitPath(line.slice('copy from '.length));
+        } else if (line.startsWith('copy to ')) {
+            newPath = unquoteGitPath(line.slice('copy to '.length));
+        } else if (line.startsWith('old mode')) {
+            modeChanged = true;
+        } else if (line.startsWith('Binary files') || line.startsWith('GIT binary patch')) {
+            binary = true;
+        } else if (line.startsWith('--- ') && !line.startsWith('--- /dev/null')) {
+            oldPath = stripPrefix(unquoteGitPath(line.slice(4)), 'a/');
+        } else if (line.startsWith('+++ ') && !line.startsWith('+++ /dev/null')) {
+            newPath = stripPrefix(unquoteGitPath(line.slice(4)), 'b/');
+        }
+    }
+
+    const path = (status === 'deleted' ? oldPath : newPath) ?? newPath ?? oldPath ?? '(unknown)';
+    return {
+        path,
+        oldPath: status === 'renamed' || status === 'copied' ? oldPath : undefined,
+        status,
+        binary,
+        modeChanged,
+        additions,
+        deletions,
+        text
+    };
+}
+
+export function computeDiffStats(sections: readonly DiffFileSection[]): DiffStats {
+    return sections.reduce<DiffStats>((stats, section) => ({
+        files: stats.files + 1,
+        additions: stats.additions + section.additions,
+        deletions: stats.deletions + section.deletions
+    }), { files: 0, additions: 0, deletions: 0 });
+}
+
+/** One line per file, e.g. "R  old.ts -> new.ts (+3 -1)". */
+export function formatFileSummary(sections: readonly DiffFileSection[]): string {
+    const letter: Record<DiffFileStatus, string> = {
+        added: 'A', deleted: 'D', renamed: 'R', copied: 'C', modified: 'M'
+    };
+    return sections.map(section => {
+        const name = section.oldPath ? `${section.oldPath} -> ${section.path}` : section.path;
+        const detail = section.binary
+            ? 'binary'
+            : `+${section.additions} -${section.deletions}`;
+        const mode = section.modeChanged ? ', mode changed' : '';
+        return `${letter[section.status]}  ${name} (${detail}${mode})`;
+    }).join('\n');
+}
+
+/**
+ * Prefixes hunk lines with their line number in the new file so the AI can
+ * point at exact lines ("+  42 | code"). Removed lines get no number.
+ */
+export function annotateDiffWithLineNumbers(diffText: string): string {
+    let newLine = 0;
+    let inHunk = false;
+    return diffText.replace(/\r\n/g, '\n').split('\n').map(line => {
+        if (line.startsWith('diff --git ')) {
+            inHunk = false;
+            return line;
+        }
+        const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        if (hunk) {
+            inHunk = true;
+            newLine = parseInt(hunk[1], 10);
+            return line;
+        }
+        if (!inHunk) {
+            return line;
+        }
+        if (line.startsWith('+')) {
+            return `+${String(newLine++).padStart(5)} | ${line.slice(1)}`;
+        }
+        if (line.startsWith('-')) {
+            return `-${' '.repeat(5)} | ${line.slice(1)}`;
+        }
+        if (line.startsWith(' ')) {
+            return ` ${String(newLine++).padStart(5)} | ${line.slice(1)}`;
+        }
+        return line; // "\ No newline at end of file" etc.
+    }).join('\n');
+}
+
+function parseHeaderPaths(rest: string): { oldPath: string; newPath: string } | undefined {
+    if (rest.startsWith('"')) {
+        const tokens: string[] = Array.from(rest.match(/"(?:[^"\\]|\\.)*"|\S+/g) ?? []);
+        const [oldToken, newToken] = tokens;
+        if (oldToken !== undefined && newToken !== undefined) {
+            return {
+                oldPath: stripPrefix(unquoteGitPath(oldToken), 'a/'),
+                newPath: stripPrefix(unquoteGitPath(newToken), 'b/')
+            };
+        }
+    }
+    // Unquoted: "a/<path> b/<path>". Paths are identical unless renamed, so split in the middle.
+    const middle = rest.indexOf(' b/', Math.floor((rest.length - 3) / 2) - 1);
+    const split = middle >= 0 ? middle : rest.indexOf(' b/');
+    if (split < 0) {
+        return undefined;
+    }
+    return {
+        oldPath: stripPrefix(rest.slice(0, split), 'a/'),
+        newPath: stripPrefix(rest.slice(split + 1), 'b/')
+    };
+}
+
+/** Decodes git's C-style quoted paths (e.g. "t\303\251st.txt") into UTF-8. */
+export function unquoteGitPath(value: string): string {
+    const trimmed = value.replace(/\t.*$/, '');
+    if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) {
+        return trimmed;
+    }
+    const bytes: number[] = [];
+    const body = trimmed.slice(1, -1);
+    const simple: Record<string, number> = { n: 10, t: 9, r: 13, '"': 34, '\\': 92, a: 7, b: 8, f: 12, v: 11 };
+    for (let i = 0; i < body.length; i++) {
+        const char = body[i];
+        if (char !== '\\') {
+            bytes.push(...Buffer.from(char, 'utf8'));
+            continue;
+        }
+        const octal = /^[0-7]{3}/.exec(body.slice(i + 1));
+        if (octal) {
+            bytes.push(parseInt(octal[0], 8));
+            i += 3;
+        } else {
+            const next = body[i + 1] ?? '\\';
+            bytes.push(simple[next] ?? next.charCodeAt(0));
+            i += 1;
+        }
+    }
+    return Buffer.from(bytes).toString('utf8');
+}
+
+function stripPrefix(value: string, prefix: string): string {
+    return value.startsWith(prefix) ? value.slice(prefix.length) : value;
+}
+
+
+
+========== src/ai/AIService.ts ==========
+import { IAIProvider } from './interfaces/IAIProvider';
+import { AIError } from './models/AIError.model';
+import { AIMessage, AIRequestOptions } from './models/AIRequest.model';
+import { AIResponse } from './models/AIResponse.model';
+import { delay } from './utils/abort';
+
+export interface AIServiceSettings {
+    enabled: boolean;
+    /** Empty string means "use the provider default". */
+    model: string;
+    timeoutMs: number;
+}
+
+export interface AIServiceOptions {
+    /** Extra attempts for transient failures (rate limit, network, 5xx). */
+    maxRetries?: number;
+
+    /** Base delay of the exponential backoff between retries. */
+    retryDelayMs?: number;
+
+    /** Random additional delay to prevent synchronized retries. */
+    retryJitterMs?: number;
+
+    /** Injectable random source, mainly for deterministic tests. */
+    random?: () => number;
+
+    log?: (line: string) => void;
+}
+
+export interface ConnectionTestResult {
+    provider: string;
+    model: string;
+    latencyMs: number;
+    reply: string;
+}
+
+/**
+ * Single entry point the features use to talk to the AI.
+ * Applies settings (enabled, model, timeout), retries transient failures,
+ * and logs timing/token usage. Has no VS Code dependency so it can be unit tested.
+ */
+export class AIService {
+    private readonly maxRetries: number;
+    private readonly retryDelayMs: number;
+    private readonly retryJitterMs: number;
+    private readonly random: () => number;
+    private readonly log: (line: string) => void;
+
+    constructor(
+        private readonly provider: IAIProvider,
+        private readonly getSettings: () => AIServiceSettings,
+        options: AIServiceOptions = {}
+    ) {
+        this.maxRetries = Math.max(0, options.maxRetries ?? 2);
+        this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 2000);
+        this.retryJitterMs = Math.max(0, options.retryJitterMs ?? 500);
+        this.random = options.random ?? Math.random;
+        this.log = options.log ?? (() => undefined);
+    }
+
+    get providerId(): string {
+        return this.provider.id;
+    }
+
+    get providerName(): string {
+        return this.provider.displayName;
+    }
+
+    get model(): string {
+        return this.getSettings().model.trim() || this.provider.defaultModel;
+    }
+
+    isEnabled(): boolean {
+        return this.getSettings().enabled;
+    }
+
+    isConfigured(): Promise<boolean> {
+        return this.provider.isConfigured();
+    }
+
+    async generate(
+        messages: AIMessage[],
+        
+        options: Omit<AIRequestOptions, 'model' | 'timeoutMs'> & {
+            timeoutMs?: number;
+            maxRetries?: number;
+        } = {}
+    ): Promise<AIResponse> {
+        const settings = this.getSettings();
+        if (!settings.enabled) {
+            throw new AIError('DISABLED', 'AI features are turned off in settings.', this.provider.id);
+        }
+        if (!await this.provider.isConfigured()) {
+            throw new AIError('MISSING_API_KEY', 'No API key has been set.', this.provider.id);
+        }
+
+        
+const {
+    maxRetries: requestMaxRetries,
+    ...providerOptions
+} = options;
+
+const maxRetries = Math.max(0, requestMaxRetries ?? this.maxRetries);
+const model = this.model;
+const promptChars = messages.reduce(
+    (sum, message) => sum + message.content.length,
+    0
+);
+
+for (let attempt = 0; ; attempt++) {
+    const started = Date.now();
+
+    try {
+        const response = await this.provider.generate({
+            messages,
+            options: {
+                ...providerOptions,
+                model,
+                timeoutMs: providerOptions.timeoutMs ?? settings.timeoutMs
+            }
+        });
+
+        const usage = response.usage
+            ? `, tokens in/out ${response.usage.inputTokens}/${response.usage.outputTokens}`
+            : '';
+
+        this.log(
+            `[${this.provider.id}] ${response.model} OK in ${Date.now() - started} ms ` +
+            `(prompt ${promptChars} chars${usage})`
+        );
+
+        return response;
+    } catch (error) {
+        const aiError = error instanceof AIError
+            ? error
+            : new AIError(
+                'PROVIDER_ERROR',
+                String(error),
+                this.provider.id,
+                undefined,
+                error
+            );
+
+        this.log(
+            `[${this.provider.id}] ${model} failed after ${Date.now() - started} ms: ` +
+            `${aiError.code} ${aiError.message}`
+        );
+
+        const transient = aiError.isRetryable && aiError.code !== 'TIMEOUT';
+
+        if (
+            !transient ||
+            attempt >= maxRetries ||
+            options.signal?.aborted
+        ) {
+            throw aiError;
+        }
+
+        const wait = calculateRetryDelay(
+            this.retryDelayMs,
+            attempt,
+            this.retryJitterMs,
+            this.random
+        );
+
+        this.log(
+            `[${this.provider.id}] retrying in ${wait} ms ` +
+            `(attempt ${attempt + 2}/${maxRetries + 1})`
+        );
+
+        try {
+            await delay(wait, options.signal);
+        } catch {
+            throw new AIError(
+                'CANCELLED',
+                'The request was cancelled.',
+                this.provider.id
+            );
+        }
+    }
+}
+
+    }
+
+    /**
+     * Generates an AI response incrementally.
+     * Preserves generate() for existing non-streaming features.
+     */
+    async generateStream(
+        messages: AIMessage[],
+        onChunk: (chunk: string) => void,
+        options: Omit<AIRequestOptions, 'model' | 'timeoutMs'> & { timeoutMs?: number } = {}
+    ): Promise<AIResponse> {
+        const settings = this.getSettings();
+
+        if (!settings.enabled) {
+            throw new AIError(
+                'DISABLED',
+                'AI features are turned off in settings.',
+                this.provider.id
+            );
+        }
+
+        if (!await this.provider.isConfigured()) {
+            throw new AIError(
+                'MISSING_API_KEY',
+                'No API key has been set.',
+                this.provider.id
+            );
+        }
+
+        if (!this.provider.generateStream) {
+            throw new AIError(
+                'PROVIDER_ERROR',
+                'This AI provider does not support streaming.',
+                this.provider.id
+            );
+        }
+
+        const model = this.model;
+        const promptChars = messages.reduce(
+            (sum, message) => sum + message.content.length,
+            0
+        );
+
+        for (let attempt = 0; ; attempt++) {
+            const started = Date.now();
+            let firstChunkAt: number | undefined;
+            let chunkCount = 0;
+            let emittedChunk = false;
+            let callbackFailed = false;
+
+            try {
+                const response = await this.provider.generateStream(
+                    {
+                        messages,
+                        options: {
+                            ...options,
+                            model,
+                            timeoutMs: options.timeoutMs ?? settings.timeoutMs
+                        }
+                    },
+                    (chunk: string) => {
+                        try {
+                            if (chunk.length > 0) {
+                                emittedChunk = true;
+                                chunkCount++;
+
+                                if (firstChunkAt === undefined) {
+                                    firstChunkAt = Date.now();
+
+                                    this.log(
+                                        `[${this.provider.id}] First chunk received after ${firstChunkAt - started} ms`
+                                    );
+                                }
+                            }
+
+                            onChunk(chunk);
+                        } catch (error) {
+                            callbackFailed = true;
+                            throw error;
+                        }
+                    }
+                );
+
+                const usage = response.usage
+                    ? `, tokens in/out ${response.usage.inputTokens}/${response.usage.outputTokens}`
+                    : '';
+
+               const totalDuration = Date.now() - started;
+                const firstChunkDuration = firstChunkAt !== undefined
+                    ? `${firstChunkAt - started} ms`
+                    : 'No chunk received';
+
+                this.log(
+                    `[${this.provider.id}] ${response.model} STREAM OK | ` +
+                    `total ${totalDuration} ms | ` +
+                    `first chunk ${firstChunkDuration} | ` +
+                    `chunks ${chunkCount} | ` +
+                    `prompt ${promptChars} chars${usage}`
+                );
+
+                return response;
+            } catch (error) {
+                // Do not convert errors thrown by the consumer's callback.
+                if (callbackFailed) {
+                    throw error;
+                }
+
+                const aiError = error instanceof AIError
+                    ? error
+                    : new AIError(
+                        'PROVIDER_ERROR',
+                        String(error),
+                        this.provider.id,
+                        undefined,
+                        error
+                    );
+
+                const totalDuration = Date.now() - started;
+
+                const firstChunkDuration =
+                    firstChunkAt !== undefined
+                        ? `${firstChunkAt - started} ms`
+                        : 'Not received';
+
+                this.log(
+                    `[${this.provider.id}] ${model} STREAM FAILED` +
+                    ` | total ${totalDuration} ms` +
+                    ` | first chunk ${firstChunkDuration}` +
+                    ` | chunks ${chunkCount}` +
+                    ` | error ${aiError.code}: ${aiError.message}`
+                );
+                const transient =
+                    aiError.isRetryable && aiError.code !== 'TIMEOUT';
+
+                // Never retry after sending partial content to the UI.
+                // Otherwise the user could receive duplicated chunks.
+                if (
+                    !transient ||
+                    emittedChunk ||
+                    attempt >= this.maxRetries ||
+                    options.signal?.aborted
+                ) {
+                    throw aiError;
+                }
+
+                const wait = calculateRetryDelay(
+                    this.retryDelayMs,
+                    attempt,
+                    this.retryJitterMs,
+                    this.random
+                );
+
+                this.log(
+                    `[${this.provider.id}] STREAM retrying in ${wait} ms (attempt ${attempt + 2}/${this.maxRetries + 1})`
+                );
+
+                try {
+                    await delay(wait, options.signal);
+                } catch {
+                    throw new AIError(
+                        'CANCELLED',
+                        'The request was cancelled.',
+                        this.provider.id
+                    );
+                }
+            }
+        }
+    }
+
+
+    /** Sends a tiny prompt to verify the key, model and network all work. */
+    async testConnection(signal?: AbortSignal): Promise<ConnectionTestResult> {
+        const started = Date.now();
+        const response = await this.generate([
+            { role: 'user', content: 'Reply with exactly the word: OK' }
+        ], { signal, temperature: 0 });
+        return {
+            provider: this.provider.displayName,
+            model: response.model,
+            latencyMs: Date.now() - started,
+            reply: response.text.trim()
+        };
+    }
+
+    async listModels(signal?: AbortSignal): Promise<string[]> {
+        return this.provider.listModels ? this.provider.listModels(signal) : [];
+    }
+}
+function calculateRetryDelay(
+    baseDelayMs: number,
+    attempt: number,
+    jitterMs: number,
+    random: () => number
+): number {
+    const exponentialDelay = baseDelayMs * 2 ** attempt;
+
+    // Clamp random value to [0, 1).
+    const randomValue = Math.min(
+        Math.max(random(), 0),
+        1 - Number.EPSILON
+    );
+
+    const jitter = Math.floor(randomValue * (jitterMs + 1));
+
+    return exponentialDelay + jitter;
+}
+
+
+
+========== src/ai/providers/GeminiProvider.ts ==========
+import { IAIProvider } from '../interfaces/IAIProvider';
+import { AIError, AIErrorCode } from '../models/AIError.model';
+import { AIMessage, AIRequest } from '../models/AIRequest.model';
+import { AIFinishReason, AIResponse } from '../models/AIResponse.model';
+import { createLinkedSignal } from '../utils/abort';
+
+export const GEMINI_DEFAULT_MODEL = 'gemini-flash-latest';
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+const DEFAULT_TIMEOUT_MS = 60_000;
+
+type FetchFn = typeof fetch;
+
+interface GeminiPart {
+    text?: string;
+    thought?: boolean;
+}
+
+interface GeminiContent {
+    role: 'user' | 'model';
+    parts: GeminiPart[];
+}
+
+interface GeminiGenerateResponse {
+    candidates?: {
+        content?: { parts?: GeminiPart[] };
+        finishReason?: string;
+    }[];
+    promptFeedback?: { blockReason?: string };
+    usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        totalTokenCount?: number;
+    };
+    modelVersion?: string;
+}
+
+interface GeminiErrorBody {
+    error?: { code?: number; message?: string; status?: string };
+}
+
+/**
+ * Google Gemini via the public REST API (no SDK dependency).
+ * Docs: https://ai.google.dev/api/generate-content
+ */
+export class GeminiProvider implements IAIProvider {
+    readonly id = 'gemini';
+    readonly displayName = 'Google Gemini';
+    readonly defaultModel = GEMINI_DEFAULT_MODEL;
+
+    constructor(
+        private readonly getApiKey: () => Promise<string | undefined>,
+        private readonly fetchFn: FetchFn = (...args) => fetch(...args),
+        private readonly baseUrl = GEMINI_BASE_URL
+    ) {}
+
+    async isConfigured(): Promise<boolean> {
+        return Boolean((await this.getApiKey())?.trim());
+    }
+
+    async generate(request: AIRequest): Promise<AIResponse> {
+        const options = request.options ?? {};
+        const model = options.model?.trim() || this.defaultModel;
+        const body = this.buildRequestBody(request);
+        const url = `${this.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
+
+        const json = await this.send<GeminiGenerateResponse>(url, {
+            method: 'POST',
+            body: JSON.stringify(body)
+        }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
+
+        return this.parseResponse(json, model);
+    }
+
+    async generateStream(
+        request: AIRequest,
+        onChunk: (chunk: string) => void
+    ): Promise<AIResponse> {
+        const options = request.options ?? {};
+        const model = options.model?.trim() || this.defaultModel;
+        const body = this.buildRequestBody(request);
+
+        const url =
+            `${this.baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+
+        const apiKey = (await this.getApiKey())?.trim();
+
+        if (!apiKey) {
+            throw new AIError(
+                'MISSING_API_KEY',
+                'Gemini API key is not set.',
+                this.id
+            );
+        }
+
+        const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+        const linked = createLinkedSignal(timeoutMs, options.signal);
+
+        try {
+            let response: Response;
+
+            try {
+                response = await this.fetchFn(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream',
+                        'x-goog-api-key': apiKey
+                    },
+                    body: JSON.stringify(body),
+                    signal: linked.signal
+                });
+            } catch (error) {
+                if (linked.timedOut()) {
+                    throw new AIError(
+                        'TIMEOUT',
+                        `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`,
+                        this.id,
+                        undefined,
+                        error
+                    );
+                }
+
+                if (linked.signal.aborted) {
+                    throw new AIError(
+                        'CANCELLED',
+                        'The request was cancelled.',
+                        this.id,
+                        undefined,
+                        error
+                    );
+                }
+
+                throw new AIError(
+                    'NETWORK',
+                    `Cannot reach Gemini: ${describe(error)}`,
+                    this.id,
+                    undefined,
+                    error
+                );
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw this.toHttpError(response.status, errorText);
+            }
+
+            const streamedResponse = await readGeminiSseStream(
+                response,
+                onChunk
+            );
+
+            return this.parseResponse(streamedResponse, model);
+        } catch (error) {
+            if (error instanceof AIError) {
+                throw error;
+            }
+
+            if (linked.timedOut()) {
+                throw new AIError(
+                    'TIMEOUT',
+                    `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`,
+                    this.id,
+                    undefined,
+                    error
+                );
+            }
+
+            if (linked.signal.aborted) {
+                throw new AIError(
+                    'CANCELLED',
+                    'The request was cancelled.',
+                    this.id,
+                    undefined,
+                    error
+                );
+            }
+
+            throw new AIError(
+                'NETWORK',
+                `Gemini streaming failed: ${describe(error)}`,
+                this.id,
+                undefined,
+                error
+            );
+        } finally {
+            linked.dispose();
+        }
+    }
+
+
+    async listModels(signal?: AbortSignal): Promise<string[]> {
+        const json = await this.send<{
+            models?: { name?: string; supportedGenerationMethods?: string[] }[];
+        }>(`${this.baseUrl}/models?pageSize=1000`, { method: 'GET' }, DEFAULT_TIMEOUT_MS, signal);
+
+        return (json.models ?? [])
+            .filter(model => model.supportedGenerationMethods?.includes('generateContent'))
+            .map(model => (model.name ?? '').replace(/^models\//, ''))
+            .filter(name => name.startsWith('gemini'))
+            .sort();
+    }
+
+    /** Exposed for unit tests. */
+    buildRequestBody(request: AIRequest): Record<string, unknown> {
+        const options = request.options ?? {};
+        const systemText = request.messages
+            .filter(message => message.role === 'system')
+            .map(message => message.content)
+            .join('\n\n');
+        const contents = toGeminiContents(
+            request.messages.filter(message => message.role !== 'system')
+        );
+        if (contents.length === 0) {
+            throw new AIError('INVALID_RESPONSE', 'The request has no user message.', this.id);
+        }
+
+        const generationConfig: Record<string, unknown> = {};
+        if (options.temperature !== undefined) {
+            generationConfig.temperature = options.temperature;
+        }
+        if (options.maxOutputTokens !== undefined) {
+            generationConfig.maxOutputTokens = options.maxOutputTokens;
+        }
+        if (options.responseFormat === 'json') {
+            generationConfig.responseMimeType = 'application/json';
+        }
+
+        return {
+            ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
+            contents,
+            ...(Object.keys(generationConfig).length ? { generationConfig } : {})
+        };
+    }
+
+    private async send<T>(
+        url: string,
+        init: { method: string; body?: string },
+        timeoutMs: number,
+        signal?: AbortSignal
+    ): Promise<T> {
+        const apiKey = (await this.getApiKey())?.trim();
+        if (!apiKey) {
+            throw new AIError('MISSING_API_KEY', 'Gemini API key is not set.', this.id);
+        }
+
+        const linked = createLinkedSignal(timeoutMs, signal);
+        let response: Response;
+        try {
+            response = await this.fetchFn(url, {
+                ...init,
+                headers: {
+                    'Content-Type': 'application/json',
+                    // Header instead of ?key= so the key never ends up in URLs or logs.
+                    'x-goog-api-key': apiKey
+                },
+                signal: linked.signal
+            });
+        } catch (error) {
+            linked.dispose();
+            if (linked.timedOut()) {
+                throw new AIError('TIMEOUT', `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`, this.id, undefined, error);
+            }
+            if (linked.signal.aborted) {
+                throw new AIError('CANCELLED', 'The request was cancelled.', this.id, undefined, error);
+            }
+            throw new AIError('NETWORK', `Cannot reach Gemini: ${describe(error)}`, this.id, undefined, error);
+        }
+
+        try {
+            const text = await response.text();
+            if (!response.ok) {
+                throw this.toHttpError(response.status, text);
+            }
+            try {
+                return JSON.parse(text) as T;
+            } catch (error) {
+                throw new AIError('INVALID_RESPONSE', 'Gemini returned a response that is not JSON.', this.id, response.status, error);
+            }
+        } catch (error) {
+            if (error instanceof AIError) {
+                throw error;
+            }
+            if (linked.timedOut()) {
+                throw new AIError('TIMEOUT', `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`, this.id, undefined, error);
+            }
+            if (linked.signal.aborted) {
+                throw new AIError('CANCELLED', 'The request was cancelled.', this.id, undefined, error);
+            }
+            throw new AIError('NETWORK', `Connection to Gemini failed: ${describe(error)}`, this.id, undefined, error);
+        } finally {
+            linked.dispose();
+        }
+    }
+
+    private toHttpError(status: number, bodyText: string): AIError {
+        let detail = bodyText.slice(0, 500);
+        let apiStatus = '';
+        try {
+            const body = JSON.parse(bodyText) as GeminiErrorBody;
+            detail = body.error?.message ?? detail;
+            apiStatus = body.error?.status ?? '';
+        } catch {
+            // Keep the raw text.
+        }
+
+        let code: AIErrorCode = 'PROVIDER_ERROR';
+        if (status === 401 || status === 403 || /api key not valid|API_KEY_INVALID/i.test(detail)) {
+            code = 'INVALID_API_KEY';
+        } else if (status === 404) {
+            code = 'MODEL_NOT_FOUND';
+        } else if (status === 429 || apiStatus === 'RESOURCE_EXHAUSTED') {
+            code = 'RATE_LIMITED';
+        }
+        return new AIError(code, `Gemini ${status}${apiStatus ? ` ${apiStatus}` : ''}: ${detail}`, this.id, status);
+    }
+
+    private parseResponse(json: GeminiGenerateResponse, requestedModel: string): AIResponse {
+        const blockReason = json.promptFeedback?.blockReason;
+        const candidate = json.candidates?.[0];
+        if (!candidate) {
+            if (blockReason) {
+                throw new AIError('CONTENT_BLOCKED', `Gemini blocked the request (${blockReason}).`, this.id);
+            }
+            throw new AIError('INVALID_RESPONSE', 'Gemini returned no answer.', this.id);
+        }
+
+        const text = (candidate.content?.parts ?? [])
+            .filter(part => !part.thought && typeof part.text === 'string')
+            .map(part => part.text)
+            .join('');
+        const finishReason = mapFinishReason(candidate.finishReason);
+
+        if (!text.trim()) {
+            if (finishReason === 'safety') {
+                throw new AIError('CONTENT_BLOCKED', `Gemini stopped the answer (${candidate.finishReason}).`, this.id);
+            }
+            if (finishReason === 'length') {
+                throw new AIError('INVALID_RESPONSE', 'Gemini ran out of output tokens before answering.', this.id);
+            }
+            throw new AIError('INVALID_RESPONSE', 'Gemini returned an empty answer.', this.id);
+        }
+
+        const usage = json.usageMetadata;
+        return {
+            text,
+            model: json.modelVersion ?? requestedModel,
+            finishReason,
+            usage: usage
+                ? {
+                    inputTokens: usage.promptTokenCount ?? 0,
+                    outputTokens: usage.candidatesTokenCount ?? 0,
+                    totalTokens: usage.totalTokenCount ?? 0
+                }
+                : undefined
+        };
+    }
+}
+
+async function readGeminiSseStream(
+    response: Response,
+    onChunk: (chunk: string) => void
+): Promise<GeminiGenerateResponse> {
+    const reader = response.body?.getReader();
+
+    if (!reader) {
+        throw new AIError(
+            'INVALID_RESPONSE',
+            'Gemini returned an empty streaming response.',
+            'gemini'
+        );
+    }
+
+    const decoder = new TextDecoder();
+
+    let buffer = '';
+    let dataLines: string[] = [];
+    let accumulatedText = '';
+
+    let mergedCandidate:
+        | {
+            content?: { parts?: GeminiPart[] };
+            finishReason?: string;
+        }
+        | undefined;
+
+    let promptFeedback: GeminiGenerateResponse['promptFeedback'];
+    let usageMetadata: GeminiGenerateResponse['usageMetadata'];
+    let modelVersion: string | undefined;
+
+    const dispatchEvent = (): void => {
+        if (dataLines.length === 0) {
+            return;
+        }
+
+        const payload = dataLines.join('\n');
+        dataLines = [];
+
+        if (!payload.trim() || payload.trim() === '[DONE]') {
+            return;
+        }
+
+        let event: GeminiGenerateResponse;
+
+        try {
+            event = JSON.parse(payload) as GeminiGenerateResponse;
+        } catch (error) {
+            throw new AIError(
+                'INVALID_RESPONSE',
+                'Gemini returned an invalid SSE event.',
+                'gemini',
+                undefined,
+                error
+            );
+        }
+
+        if (event.promptFeedback) {
+            promptFeedback = event.promptFeedback;
+        }
+
+        if (event.usageMetadata) {
+            usageMetadata = event.usageMetadata;
+        }
+
+        if (event.modelVersion) {
+            modelVersion = event.modelVersion;
+        }
+
+        const candidate = event.candidates?.[0];
+
+        if (!candidate) {
+            return;
+        }
+
+        mergedCandidate ??= {};
+
+        for (const part of candidate.content?.parts ?? []) {
+            if (part.thought || typeof part.text !== 'string') {
+                continue;
+            }
+
+            if (!part.text) {
+                continue;
+            }
+
+            accumulatedText += part.text;
+            onChunk(part.text);
+        }
+
+        if (candidate.finishReason) {
+            mergedCandidate.finishReason = candidate.finishReason;
+        }
+    };
+
+    const processLine = (line: string): void => {
+        if (line === '') {
+            dispatchEvent();
+            return;
+        }
+
+        // Ignore SSE comments and metadata fields.
+        if (line.startsWith(':')) {
+            return;
+        }
+
+        if (line.startsWith('data:')) {
+            let value = line.slice(5);
+
+            if (value.startsWith(' ')) {
+                value = value.slice(1);
+            }
+
+            dataLines.push(value);
+        }
+    };
+
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+
+            if (done) {
+                break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+
+            let newlineIndex: number;
+
+            while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                let line = buffer.slice(0, newlineIndex);
+                buffer = buffer.slice(newlineIndex + 1);
+
+                if (line.endsWith('\r')) {
+                    line = line.slice(0, -1);
+                }
+
+                processLine(line);
+            }
+        }
+
+        // Flush the decoder and process the final incomplete line.
+        buffer += decoder.decode();
+
+        if (buffer.length > 0) {
+            processLine(buffer.endsWith('\r') ? buffer.slice(0, -1) : buffer);
+        }
+
+        // Dispatch the final event if the stream doesn't end with a blank line.
+        dispatchEvent();
+    } finally {
+        reader.releaseLock();
+    }
+
+    return {
+        candidates: mergedCandidate
+            ? [{
+                content: {
+                    parts: accumulatedText
+                        ? [{ text: accumulatedText }]
+                        : []
+                },
+                finishReason: mergedCandidate.finishReason
+            }]
+            : undefined,
+        promptFeedback,
+        usageMetadata,
+        modelVersion
+    };
+}
+
+
+/** Gemini needs user/model roles and rejects back-to-back turns of the same role. */
+function toGeminiContents(messages: AIMessage[]): GeminiContent[] {
+    const contents: GeminiContent[] = [];
+    for (const message of messages) {
+        const role = message.role === 'assistant' ? 'model' : 'user';
+        const last = contents[contents.length - 1];
+        if (last?.role === role) {
+            last.parts.push({ text: message.content });
+        } else {
+            contents.push({ role, parts: [{ text: message.content }] });
+        }
+    }
+    return contents;
+}
+
+function mapFinishReason(reason: string | undefined): AIFinishReason {
+    switch (reason) {
+        case 'STOP':
+            return 'stop';
+        case 'MAX_TOKENS':
+            return 'length';
+        case 'SAFETY':
+        case 'RECITATION':
+        case 'BLOCKLIST':
+        case 'PROHIBITED_CONTENT':
+        case 'SPII':
+            return 'safety';
+        default:
+            return 'other';
+    }
+}
+
+function describe(error: unknown): string {
+    if (error instanceof Error) {
+        const cause = (error as Error & { cause?: unknown }).cause;
+        return cause instanceof Error ? `${error.message} (${cause.message})` : error.message;
+    }
+    return String(error);
+}
+
+
+
+========== src/ai/models/AIError.model.ts ==========
+export type AIErrorCode =
+    | 'DISABLED'
+    | 'MISSING_API_KEY'
+    | 'INVALID_API_KEY'
+    | 'MODEL_NOT_FOUND'
+    | 'RATE_LIMITED'
+    | 'TIMEOUT'
+    | 'CANCELLED'
+    | 'NETWORK'
+    | 'CONTENT_BLOCKED'
+    | 'INVALID_RESPONSE'
+    | 'PROVIDER_ERROR';
+
+/**
+ * Provider-agnostic error. Every provider converts its own failures
+ * (HTTP status, SDK exceptions, ...) into an AIError so the UI layer
+ * only has to handle one error type.
+ */
+export class AIError extends Error {
+    constructor(
+        public readonly code: AIErrorCode,
+        message: string,
+        public readonly providerId: string,
+        public readonly statusCode?: number,
+        cause?: unknown
+    ) {
+        super(message, { cause });
+        this.name = 'AIError';
+    }
+
+    /** Whether the same request could succeed if tried again later. */
+    get isRetryable(): boolean {
+        return this.code === 'RATE_LIMITED'
+            || this.code === 'TIMEOUT'
+            || this.code === 'NETWORK'
+            || (this.code === 'PROVIDER_ERROR'
+                && this.statusCode !== undefined
+                && this.statusCode >= 500);
+    }
+}
+
+export function isAIError(error: unknown): error is AIError {
+    return error instanceof AIError;
+}
+
+
+
+========== src/ui/AIController.ts ==========
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { AIService, AIServiceSettings } from '../ai/AIService';
+import { AIPreferences, DEFAULT_PREFERENCES } from '../ai/AIPreferences';
+import { ApiKeyManager } from '../ai/ApiKeyManager';
+import { DEFAULT_EXCLUDE_PATTERNS } from '../ai/context/ContextLimiter';
+import { GitContextBuilder } from '../ai/context/GitContextBuilder';
+import { GitContext, GitDiffScope } from '../ai/context/GitContext.model';
+import { describeAIError } from '../ai/errorMessages';
+import { AIFeatureDeps, FeatureUnavailableError } from '../ai/features/AIFeatureContext';
+import { CodeReviewFeature } from '../ai/features/CodeReviewFeature';
+import { CommitMessageFeature } from '../ai/features/CommitMessageFeature';
+import { ConflictAssistantFeature } from '../ai/features/ConflictAssistantFeature';
+import { ExplainDiffFeature } from '../ai/features/ExplainDiffFeature';
+import { ChatTurn, GitChatSession } from '../ai/features/GitChatSession';
+import { SummaryFeature } from '../ai/features/SummaryFeature';
+import { AIError } from '../ai/models/AIError.model';
+import { GeminiProvider } from '../ai/providers/GeminiProvider';
+import { computeDiffStats } from '../ai/context/diffUtils';
+import { IDiffService } from '../git/interfaces/DiffService.interface';
+import { ICommitService } from '../git/interfaces/CommitService.interface';
+import { IBranchService } from '../git/interfaces/IGitBranchService';
+import { IStatusService } from '../git/interfaces/IGitStatusService';
+import { IConflictService } from '../git/interfaces/ConflictService.interface';
+import { AIResultPanel } from './AIResultPanel';
+import { escapeHtml, renderMarkdown } from './markdown';
+
+export type AITask =
+    | 'commit' | 'explain' | 'review' | 'chat' | 'test'
+    | 'historySummary' | 'branchSummary' | 'conflict' | 'models';
+
+export interface AIViewState {
+    status: {
+        enabled: boolean;
+        provider: string;
+        model: string;
+        hasApiKey: boolean;
+    };
+    busy: AITask[];
+    chat: { role: 'user' | 'assistant'; html: string; text: string }[];
+}
+
+export interface AIControllerDeps {
+    workspaceRoot: string;
+    status: IStatusService;
+    diff: IDiffService;
+    branch: IBranchService;
+    commit: ICommitService;
+    conflict: IConflictService;
+}
+
+interface GitExtensionApi {
+    repositories: { rootUri: vscode.Uri; inputBox: { value: string } }[];
+}
+
+const CONSENT_KEY = 'aiGitAssistant.ai.dataConsent.v1';
+const CHAT_KEY = 'aiGitAssistant.ai.chatHistory';
+const PROPOSAL_SCHEME = 'ai-git-proposal';
+const SIDEBAR_VIEW_ID = 'aiGitAssistant.overview';
+
+/**
+ * VS Code glue for every AI feature: settings, API key, consent, progress/cancellation,
+ * error notifications and result display. The features themselves live in src/ai.
+ */
+export class AIController implements vscode.Disposable {
+    private readonly output = vscode.window.createOutputChannel('AI Git Assistant');
+    private readonly stateEmitter = new vscode.EventEmitter<AIViewState>();
+    readonly onDidChangeState = this.stateEmitter.event;
+
+    private readonly ai: AIService;
+    private readonly commitFeature: CommitMessageFeature;
+    private readonly explainFeature: ExplainDiffFeature;
+    private readonly reviewFeature: CodeReviewFeature;
+    private readonly conflictFeature: ConflictAssistantFeature;
+    private readonly summaryFeature: SummaryFeature;
+    private readonly chatSession: GitChatSession;
+    private readonly panel: AIResultPanel;
+
+    private readonly running = new Map<AITask, AbortController>();
+    private readonly proposals = new Map<string, string>();
+    private readonly disposables: vscode.Disposable[] = [];
+    private hasApiKey = false;
+
+    constructor(
+        private readonly context: vscode.ExtensionContext,
+        private readonly apiKeys: ApiKeyManager,
+        private readonly deps: AIControllerDeps
+    ) {
+        const provider = new GeminiProvider(() => this.apiKeys.getApiKey());
+        this.ai = new AIService(provider, () => this.readServiceSettings(), {
+            log: line => this.output.appendLine(`${new Date().toISOString()} ${line}`)
+        });
+
+        const featureDeps: AIFeatureDeps = {
+            ai: this.ai,
+            contextBuilder: new GitContextBuilder(deps.status, deps.diff, deps.branch, deps.commit, deps.workspaceRoot),
+            commits: deps.commit,
+            getPreferences: () => this.readPreferences()
+        };
+        this.commitFeature = new CommitMessageFeature(featureDeps);
+        this.explainFeature = new ExplainDiffFeature(featureDeps);
+        this.reviewFeature = new CodeReviewFeature(featureDeps);
+        this.conflictFeature = new ConflictAssistantFeature(featureDeps);
+        this.summaryFeature = new SummaryFeature(featureDeps);
+        this.chatSession = new GitChatSession(
+            featureDeps,
+            context.workspaceState.get<ChatTurn[]>(CHAT_KEY, [])
+        );
+        this.panel = new AIResultPanel(context.extensionUri, (file, line) => this.openFileAt(file, line));
+
+        this.disposables.push(
+            this.output,
+            this.stateEmitter,
+            this.apiKeys.onDidChange(() => void this.refreshStatus()),
+            vscode.workspace.onDidChangeConfiguration(event => {
+                if (event.affectsConfiguration('aiGitAssistant.ai')) {
+                    this.fireState();
+                }
+            }),
+            vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, {
+                provideTextDocumentContent: uri => this.proposals.get(uri.query) ?? ''
+            })
+        );
+        void this.refreshStatus();
+    }
+
+    dispose(): void {
+        for (const controller of this.running.values()) {
+            controller.abort();
+        }
+
+        this.panel.dispose();
+        this.disposables.forEach(disposable => disposable.dispose());
+    }
+
+    // ------------------------------------------------------------------
+    // State for the sidebar
+    // ------------------------------------------------------------------
+
+    getState(): AIViewState {
+        return {
+            status: {
+                enabled: this.ai.isEnabled(),
+                provider: this.ai.providerName,
+                model: this.ai.model,
+                hasApiKey: this.hasApiKey
+            },
+            busy: [...this.running.keys()],
+            chat: this.chatSession.history.map(turn => ({
+                role: turn.role,
+                text: turn.content,
+                html: turn.role === 'assistant'
+                    ? renderMarkdown(turn.content)
+                    : escapeHtml(turn.content).replace(/\n/g, '<br>')
+            }))
+        };
+    }
+
+    private async refreshStatus(): Promise<void> {
+        this.hasApiKey = await this.apiKeys.hasApiKey();
+        this.fireState();
+    }
+
+    private fireState(): void {
+        this.stateEmitter.fire(this.getState());
+    }
+
+    cancel(task?: AITask): void {
+        if (task) {
+            this.running.get(task)?.abort();
+            return;
+        }
+        for (const controller of this.running.values()) {
+            controller.abort();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // EPIC 07: API key, connection test, model selection
+    // ------------------------------------------------------------------
+
+    async setApiKey(): Promise<void> {
+        if (await this.apiKeys.promptForApiKey()) {
+            await this.refreshStatus();
+            const choice = await vscode.window.showInformationMessage(
+                'Đã lưu Gemini API key an toàn trong SecretStorage.',
+                'Kiểm tra kết nối'
+            );
+            if (choice) {
+                await this.testConnection();
+            }
+        }
+    }
+
+    async clearApiKey(): Promise<void> {
+        const confirm = await vscode.window.showWarningMessage(
+            'Xóa Gemini API key đã lưu?', { modal: true }, 'Xóa'
+        );
+        if (confirm === 'Xóa') {
+            await this.apiKeys.deleteApiKey();
+            await this.refreshStatus();
+            void vscode.window.showInformationMessage('Đã xóa API key.');
+        }
+    }
+
+    async testConnection(): Promise<void> {
+        const result = await this.runTask('test', 'Đang kiểm tra kết nối AI...', 'notification',
+            signal => this.ai.testConnection(signal), { needsConsent: false });
+        if (result) {
+            void vscode.window.showInformationMessage(
+                `✓ Kết nối ${result.provider} thành công · model ${result.model} · ${result.latencyMs} ms · trả lời: "${result.reply.slice(0, 40)}"`
+            );
+        }
+    }
+
+    async selectModel(): Promise<void> {
+        const models = await this.runTask('models', 'Đang tải danh sách model...', 'notification',
+            signal => this.ai.listModels(signal), { needsConsent: false });
+        if (!models) {
+            return;
+        }
+        const current = this.ai.model;
+        const picked = await vscode.window.showQuickPick(
+            models.map(model => ({ label: model, description: model === current ? 'đang dùng' : undefined })),
+            { placeHolder: `Chọn model Gemini (hiện tại: ${current})`, matchOnDescription: true }
+        );
+        if (picked) {
+            await vscode.workspace.getConfiguration('aiGitAssistant.ai')
+                .update('model', picked.label, vscode.ConfigurationTarget.Global);
+            void vscode.window.showInformationMessage(`Đã chọn model ${picked.label}.`);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // EPIC 09: commit message
+    // ------------------------------------------------------------------
+
+    /** Returns the generated message, or undefined if cancelled/failed (already reported). */
+    async generateCommitMessage(scope: 'staged' | 'auto' = 'staged'): Promise<string | undefined> {
+        const result = await this.runTask('commit', 'AI đang tạo commit message...', 'view',
+            signal => this.commitFeature.generate({ scope, signal }));
+        if (result) {
+            this.logContext('commit message', result.context);
+        }
+        return result?.message;
+    }
+
+    /** Fills the built-in Source Control input box. */
+    async generateCommitMessageForScm(sourceControl?: { rootUri?: vscode.Uri }): Promise<void> {
+        const repository = await this.findScmRepository(sourceControl?.rootUri);
+        if (!repository) {
+            void vscode.window.showWarningMessage('Không tìm thấy Git repository của workspace trong Source Control.');
+            return;
+        }
+        const message = await this.generateCommitMessage('auto');
+        if (message) {
+            repository.inputBox.value = message;
+            void vscode.commands.executeCommand('workbench.view.scm');
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // EPIC 10 / 11: explain diff, code review
+    // ------------------------------------------------------------------
+
+    async explainChanges(scope: GitDiffScope = 'auto'): Promise<void> {
+        let streamingStarted = false;
+
+        const result = await this.runTask(
+            'explain',
+            'AI đang giải thích thay đổi...',
+            'notification',
+            signal => {
+                this.panel.startStreamingMarkdown('AI Explain Diff');
+                streamingStarted = true;
+
+                return this.explainFeature.explain(
+                    scope,
+                    signal,
+                    chunk => this.panel.appendStreamingMarkdown(chunk)
+                );
+            },
+            {
+                onError: error => {
+                    if (!streamingStarted) return;
+
+                    const message =
+                        error instanceof AIError && error.code === 'CANCELLED'
+                            ? 'Yêu cầu AI đã bị hủy.'
+                            : error instanceof FeatureUnavailableError
+                                ? error.message
+                                : describeAIError(error);
+
+                    this.panel.showStreamingError(message);
+                }
+            }
+        );
+
+        if (!result) {
+            if (!streamingStarted) {
+                this.panel.disposeIfLoading();
+            }
+            return;
+        }
+
+        this.logContext('explain', result.context);
+
+        this.panel.showMarkdown('AI Explain Diff', result.markdown, {
+            subtitle: `${scopeLabel(result.context)} · ${result.stats.files} file · +${result.stats.additions} −${result.stats.deletions} · ${this.ai.model}`,
+            notes: contextNotes(result.context)
+        });
+}
+    async reviewChanges(scope: GitDiffScope = 'auto'): Promise<void> {
+        this.panel.showLoading('AI Code Review', 'AI đang review code...');
+        const result = await this.runTask('review', 'AI đang review code...', 'notification',
+            signal => this.reviewFeature.review(scope, signal));
+        if (!result) {
+            this.panel.disposeIfLoading();
+            return;
+        }
+        this.logContext('review', result.context);
+        const stats = computeDiffStats(result.context.diff.files);
+        this.panel.showReview('AI Code Review', result, {
+            subtitle: `${scopeLabel(result.context)} · ${stats.files} file · +${stats.additions} −${stats.deletions} · ${this.ai.model}`,
+            notes: contextNotes(result.context)
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // EPIC 12: chat
+    // ------------------------------------------------------------------
+
+    /** Returns true when the question was answered. */
+    async chat(question: string): Promise<boolean> {
+        if (!question.trim()) {
+            return false;
+        }
+        const answer = await this.runTask('chat', 'AI đang trả lời...', 'view',
+            signal => this.chatSession.ask(question, signal));
+        if (answer) {
+            await this.context.workspaceState.update(CHAT_KEY, this.chatSession.history);
+            this.fireState();
+        }
+        return Boolean(answer);
+    }
+
+    async clearChat(): Promise<void> {
+        this.cancel('chat');
+        this.chatSession.clear();
+        await this.context.workspaceState.update(CHAT_KEY, []);
+        this.fireState();
+    }
+
+    // ------------------------------------------------------------------
+    // EPIC 13: summaries and merge conflict assistant
+    // ------------------------------------------------------------------
+
+    async summarizeHistory(): Promise<void> {
+        const picked = await vscode.window.showQuickPick(
+            ['20', '50', '100'].map(count => ({ label: `${count} commit gần nhất`, count: Number(count) })),
+            { placeHolder: 'Tóm tắt bao nhiêu commit?' }
+        );
+        if (!picked) {
+            return;
+        }
+        this.panel.showLoading('AI History Summary', 'AI đang tóm tắt lịch sử commit...');
+        const result = await this.runTask('historySummary', 'AI đang tóm tắt lịch sử commit...', 'notification',
+            signal => this.summaryFeature.summarizeHistory(picked.count, signal));
+        if (!result) {
+            this.panel.disposeIfLoading();
+            return;
+        }
+        this.panel.showMarkdown(result.title, result.markdown, { subtitle: this.ai.model });
+    }
+
+    async summarizeBranch(): Promise<void> {
+        const base = await this.pickBaseBranch();
+        if (!base) {
+            return;
+        }
+        this.panel.showLoading('AI Branch Summary', `AI đang so sánh branch hiện tại với ${base}...`);
+        const result = await this.runTask('branchSummary', 'AI đang tóm tắt branch...', 'notification',
+            signal => this.summaryFeature.summarizeBranch(base, signal));
+        if (!result) {
+            this.panel.disposeIfLoading();
+            return;
+        }
+        this.panel.showMarkdown(result.title, result.markdown, { subtitle: this.ai.model });
+    }
+
+    /** Returns true if the file was changed (caller should refresh). */
+    async suggestConflictResolution(filePath: string): Promise<boolean> {
+        const uri = vscode.Uri.file(this.resolveInWorkspace(filePath));
+        const document = await vscode.workspace.openTextDocument(uri);
+        const original = document.getText();
+
+        const suggestion = await this.runTask('conflict', `AI đang đề xuất cách giải quyết conflict cho ${path.basename(filePath)}...`, 'notification',
+            signal => this.conflictFeature.suggest(filePath, original, signal));
+        if (!suggestion) {
+            return false;
+        }
+
+        const id = `${Date.now()}`;
+        this.proposals.set(id, suggestion.resolvedContent);
+        const proposalUri = vscode.Uri.from({ scheme: PROPOSAL_SCHEME, path: `/${filePath}`, query: id });
+        const explanation = [
+            suggestion.summary,
+            '',
+            ...suggestion.explanations.map(item => `- **Conflict ${item.index + 1}:** ${item.explanation}`)
+        ].join('\n');
+        this.panel.showMarkdown(`AI Conflict: ${path.basename(filePath)}`, explanation, {
+            subtitle: `${suggestion.conflictCount} conflict · ${this.ai.model}`,
+            notes: ['Xem diff bên cạnh để kiểm tra đề xuất trước khi áp dụng. AI có thể sai — hãy đọc kỹ.']
+        });
+        await vscode.commands.executeCommand('vscode.diff', uri, proposalUri,
+            `${path.basename(filePath)} ↔ AI đề xuất`, { viewColumn: vscode.ViewColumn.One });
+
+        const choice = await vscode.window.showInformationMessage(
+            `Áp dụng cách giải quyết AI đề xuất cho ${filePath}?`,
+            'Áp dụng', 'Áp dụng & Mark resolved', 'Bỏ qua'
+        );
+        this.proposals.delete(id);
+        if (choice !== 'Áp dụng' && choice !== 'Áp dụng & Mark resolved') {
+            return false;
+        }
+        if (document.getText() !== original) {
+            void vscode.window.showWarningMessage('File đã thay đổi trong lúc chờ AI. Hãy chạy lại đề xuất.');
+            return false;
+        }
+
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(uri, new vscode.Range(0, 0, document.lineCount, 0), suggestion.resolvedContent);
+        if (!await vscode.workspace.applyEdit(edit) || !await document.save()) {
+            void vscode.window.showErrorMessage('Không thể ghi file.');
+            return false;
+        }
+        if (choice === 'Áp dụng & Mark resolved') {
+            await this.deps.conflict.markConflictResolved(filePath);
+        }
+        void vscode.window.showInformationMessage(`Đã áp dụng đề xuất của AI cho ${filePath}.`);
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Task runner: readiness, progress, cancellation, errors (TASK 7.5)
+    // ------------------------------------------------------------------
+
+    private async runTask<T>(
+        task: AITask,
+        title: string,
+        location: 'notification' | 'view',
+        work: (signal: AbortSignal) => Promise<T>,
+        options: {
+            needsConsent?: boolean;
+            onError?: (error: unknown) => void;
+        } = {}
+    ): Promise<T | undefined> {
+        if (this.running.has(task)) {
+            void vscode.window.showInformationMessage('Yêu cầu trước đó vẫn đang chạy, vui lòng đợi.');
+            return undefined;
+        }
+        if (!await this.ensureReady(options.needsConsent !== false)) {
+            return undefined;
+        }
+
+        const controller = new AbortController();
+        this.running.set(task, controller);
+        this.fireState();
+        try {
+            return await vscode.window.withProgress({
+                location: location === 'notification'
+                    ? vscode.ProgressLocation.Notification
+                    : { viewId: SIDEBAR_VIEW_ID },
+                title,
+                cancellable: true
+            }, (_progress, token) => {
+                token.onCancellationRequested(() => controller.abort());
+                return work(controller.signal);
+            });
+        } catch (error) {
+             options.onError?.(error);
+            await this.reportError(error);
+            return undefined;
+        } finally {
+            this.running.delete(task);
+            this.fireState();
+        }
+    }
+
+    private async ensureReady(needsConsent: boolean): Promise<boolean> {
+        if (!this.ai.isEnabled()) {
+            const choice = await vscode.window.showWarningMessage('Tính năng AI đang tắt.', 'Bật AI');
+            if (choice !== 'Bật AI') {
+                return false;
+            }
+            await vscode.workspace.getConfiguration('aiGitAssistant.ai')
+                .update('enabled', true, vscode.ConfigurationTarget.Global);
+        }
+        if (!await this.ai.isConfigured()) {
+            const choice = await vscode.window.showWarningMessage(
+                'Chưa có Gemini API key. Nhập key để dùng tính năng AI.', 'Nhập API Key'
+            );
+            if (choice !== 'Nhập API Key' || !await this.apiKeys.promptForApiKey()) {
+                return false;
+            }
+            await this.refreshStatus();
+        }
+        if (needsConsent && !this.context.globalState.get<boolean>(CONSENT_KEY)) {
+            const choice = await vscode.window.showWarningMessage(
+                'AI Git Assistant sẽ gửi diff, tên file và lịch sử commit của repository tới Google Gemini để phân tích.',
+                {
+                    modal: true,
+                    detail: 'File nhạy cảm (.env, *.pem, *.key, ...) không được gửi và các giá trị giống secret/API key được tự động che. Không dùng với code bạn không được phép chia sẻ.'
+                },
+                'Đồng ý'
+            );
+            if (choice !== 'Đồng ý') {
+                return false;
+            }
+            await this.context.globalState.update(CONSENT_KEY, true);
+        }
+        return true;
+    }
+
+    private async reportError(error: unknown): Promise<void> {
+        this.output.appendLine(`${new Date().toISOString()} ERROR ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
+
+        if (error instanceof FeatureUnavailableError) {
+            void vscode.window.showWarningMessage(error.message);
+            return;
+        }
+        if (error instanceof AIError && error.code === 'CANCELLED') {
+            vscode.window.setStatusBarMessage('AI: đã hủy yêu cầu.', 3000);
+            return;
+        }
+
+        const message = describeAIError(error);
+        if (error instanceof AIError) {
+            if (error.code === 'MISSING_API_KEY' || error.code === 'INVALID_API_KEY') {
+                if (await vscode.window.showErrorMessage(message, 'Nhập API Key') === 'Nhập API Key') {
+                    await this.setApiKey();
+                }
+                return;
+            }
+            if (error.code === 'MODEL_NOT_FOUND') {
+                if (await vscode.window.showErrorMessage(message, 'Chọn model') === 'Chọn model') {
+                    await this.selectModel();
+                }
+                return;
+            }
+        }
+        if (await vscode.window.showErrorMessage(message, 'Xem log') === 'Xem log') {
+            this.output.show(true);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    private readServiceSettings(): AIServiceSettings {
+        const config = vscode.workspace.getConfiguration('aiGitAssistant.ai');
+        return {
+            enabled: config.get<boolean>('enabled', true),
+            model: config.get<string>('model', ''),
+            timeoutMs: Math.max(5, config.get<number>('timeoutSeconds', 60)) * 1000
+        };
+    }
+
+    private readPreferences(): AIPreferences {
+        const config = vscode.workspace.getConfiguration('aiGitAssistant.ai');
+        const style = config.get<string>('commitMessageStyle', DEFAULT_PREFERENCES.commitStyle);
+        return {
+            responseLanguage: config.get<string>('responseLanguage', DEFAULT_PREFERENCES.responseLanguage),
+            commitLanguage: config.get<string>('commitMessageLanguage', DEFAULT_PREFERENCES.commitLanguage),
+            commitStyle: style === 'simple' ? 'simple' : 'conventional',
+            maxContextChars: Math.max(2000, config.get<number>('maxContextChars', DEFAULT_PREFERENCES.maxContextChars)),
+            excludePatterns: config.get<string[]>('excludeFiles', [...DEFAULT_EXCLUDE_PATTERNS]),
+            redactSecrets: config.get<boolean>('redactSecrets', true)
+        };
+    }
+
+    private logContext(feature: string, context: GitContext): void {
+        const stats = computeDiffStats(context.diff.files);
+        this.output.appendLine(
+            `${new Date().toISOString()} [${feature}] context: ${scopeLabel(context)}, ${stats.files} file(s), ` +
+            `${context.diff.text.length}/${context.diff.originalChars} chars sent, ` +
+            `${context.diff.omitted.length} omitted, ${context.diff.truncatedFiles.length} truncated, ${context.diff.redactions} redaction(s)`
+        );
+    }
+
+    private async pickBaseBranch(): Promise<string | undefined> {
+        const branches = await this.deps.branch.getBranches();
+        const current = branches.find(branch => branch.current)?.name;
+        const preferred = ['main', 'master', 'develop', 'origin/main', 'origin/master', 'origin/develop'];
+        const names = branches
+            .map(branch => branch.name)
+            .filter(name => name !== current)
+            .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+        function rank(name: string): number {
+            const index = preferred.indexOf(name);
+            return index < 0 ? preferred.length : index;
+        }
+        if (names.length === 0) {
+            void vscode.window.showWarningMessage('Không có branch nào khác để so sánh.');
+            return undefined;
+        }
+        return vscode.window.showQuickPick(names, {
+            placeHolder: `So sánh branch "${current ?? 'HEAD'}" với branch gốc nào?`
+        });
+    }
+
+    private async findScmRepository(rootUri?: vscode.Uri): Promise<GitExtensionApi['repositories'][number] | undefined> {
+        const extension = vscode.extensions.getExtension<{ getAPI(version: 1): GitExtensionApi }>('vscode.git');
+        if (!extension) {
+            return undefined;
+        }
+        const exports = extension.isActive ? extension.exports : await extension.activate();
+        const repositories = exports.getAPI(1).repositories;
+        const target = (rootUri?.fsPath ?? this.deps.workspaceRoot).toLowerCase();
+        return repositories.find(repo => repo.rootUri.fsPath.toLowerCase() === target)
+            ?? repositories.find(repo => target.startsWith(repo.rootUri.fsPath.toLowerCase()))
+            ?? (rootUri ? undefined : repositories[0]);
+    }
+
+    private resolveInWorkspace(filePath: string): string {
+        const root = path.resolve(this.deps.workspaceRoot);
+        const absolute = path.resolve(root, filePath);
+        const relative = path.relative(root, absolute);
+        if (!filePath || relative.startsWith('..') || path.isAbsolute(relative)) {
+            throw new Error('Đường dẫn file nằm ngoài workspace.');
+        }
+        return absolute;
+    }
+
+    async openFileAt(filePath: string, line?: number): Promise<void> {
+        try {
+            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(this.resolveInWorkspace(filePath)));
+            const position = new vscode.Position(Math.max(0, (line ?? 1) - 1), 0);
+            await vscode.window.showTextDocument(document, {
+                viewColumn: vscode.ViewColumn.One,
+                selection: new vscode.Range(position, position)
+            });
+        } catch (error) {
+            void vscode.window.showWarningMessage(`Không mở được ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+}
+
+function scopeLabel(context: GitContext): string {
+    switch (context.diffScope) {
+        case 'staged': return 'Thay đổi đã stage';
+        case 'working': return 'Thay đổi chưa stage';
+        case 'all': return 'Tất cả thay đổi chưa commit';
+        case 'range': return `So sánh ${context.range}`;
+        default: return 'Không có diff';
+    }
+}
+
+function contextNotes(context: GitContext): string[] {
+    const notes: string[] = [];
+    if (context.diff.truncatedFiles.length) {
+        notes.push(`Diff quá lớn nên đã được rút gọn: ${context.diff.truncatedFiles.join(', ')}.`);
+    }
+    const omitted = context.diff.omitted.filter(item => item.reason !== 'binary');
+    if (omitted.length) {
+        notes.push(`Không gửi nội dung: ${omitted.map(item => `${item.path} (${item.reason === 'sensitive' ? 'file nhạy cảm' : 'file sinh tự động'})`).join(', ')}.`);
+    }
+    if (context.diff.redactions) {
+        notes.push(`Đã che ${context.diff.redactions} giá trị giống secret/API key trước khi gửi cho AI.`);
+    }
+    return notes;
+}

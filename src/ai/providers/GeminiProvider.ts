@@ -151,10 +151,6 @@ export class GeminiProvider implements IAIProvider {
 
             return this.parseResponse(streamedResponse, model);
         } catch (error) {
-            if (error instanceof AIError) {
-                throw error;
-            }
-
             if (linked.timedOut()) {
                 throw new AIError(
                     'TIMEOUT',
@@ -173,6 +169,10 @@ export class GeminiProvider implements IAIProvider {
                     undefined,
                     error
                 );
+            }
+
+            if (error instanceof AIError) {
+                throw error;
             }
 
             throw new AIError(
@@ -277,14 +277,14 @@ export class GeminiProvider implements IAIProvider {
                 throw new AIError('INVALID_RESPONSE', 'Gemini returned a response that is not JSON.', this.id, response.status, error);
             }
         } catch (error) {
-            if (error instanceof AIError) {
-                throw error;
-            }
             if (linked.timedOut()) {
                 throw new AIError('TIMEOUT', `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`, this.id, undefined, error);
             }
             if (linked.signal.aborted) {
                 throw new AIError('CANCELLED', 'The request was cancelled.', this.id, undefined, error);
+            }
+            if (error instanceof AIError) {
+                throw error;
             }
             throw new AIError('NETWORK', `Connection to Gemini failed: ${describe(error)}`, this.id, undefined, error);
         } finally {
