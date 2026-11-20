@@ -71,6 +71,123 @@ export class GeminiProvider implements IAIProvider {
         return this.parseResponse(json, model);
     }
 
+    async generateStream(
+        request: AIRequest,
+        onChunk: (chunk: string) => void
+    ): Promise<AIResponse> {
+        const options = request.options ?? {};
+        const model = options.model?.trim() || this.defaultModel;
+        const body = this.buildRequestBody(request);
+
+        const url =
+            `${this.baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+
+        const apiKey = (await this.getApiKey())?.trim();
+
+        if (!apiKey) {
+            throw new AIError(
+                'MISSING_API_KEY',
+                'Gemini API key is not set.',
+                this.id
+            );
+        }
+
+        const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+        const linked = createLinkedSignal(timeoutMs, options.signal);
+
+        try {
+            let response: Response;
+
+            try {
+                response = await this.fetchFn(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream',
+                        'x-goog-api-key': apiKey
+                    },
+                    body: JSON.stringify(body),
+                    signal: linked.signal
+                });
+            } catch (error) {
+                if (linked.timedOut()) {
+                    throw new AIError(
+                        'TIMEOUT',
+                        `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`,
+                        this.id,
+                        undefined,
+                        error
+                    );
+                }
+
+                if (linked.signal.aborted) {
+                    throw new AIError(
+                        'CANCELLED',
+                        'The request was cancelled.',
+                        this.id,
+                        undefined,
+                        error
+                    );
+                }
+
+                throw new AIError(
+                    'NETWORK',
+                    `Cannot reach Gemini: ${describe(error)}`,
+                    this.id,
+                    undefined,
+                    error
+                );
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw this.toHttpError(response.status, errorText);
+            }
+
+            const streamedResponse = await readGeminiSseStream(
+                response,
+                onChunk
+            );
+
+            return this.parseResponse(streamedResponse, model);
+        } catch (error) {
+            if (error instanceof AIError) {
+                throw error;
+            }
+
+            if (linked.timedOut()) {
+                throw new AIError(
+                    'TIMEOUT',
+                    `Gemini did not respond within ${Math.round(timeoutMs / 1000)}s.`,
+                    this.id,
+                    undefined,
+                    error
+                );
+            }
+
+            if (linked.signal.aborted) {
+                throw new AIError(
+                    'CANCELLED',
+                    'The request was cancelled.',
+                    this.id,
+                    undefined,
+                    error
+                );
+            }
+
+            throw new AIError(
+                'NETWORK',
+                `Gemini streaming failed: ${describe(error)}`,
+                this.id,
+                undefined,
+                error
+            );
+        } finally {
+            linked.dispose();
+        }
+    }
+
+
     async listModels(signal?: AbortSignal): Promise<string[]> {
         const json = await this.send<{
             models?: { name?: string; supportedGenerationMethods?: string[] }[];
@@ -238,6 +355,178 @@ export class GeminiProvider implements IAIProvider {
         };
     }
 }
+
+async function readGeminiSseStream(
+    response: Response,
+    onChunk: (chunk: string) => void
+): Promise<GeminiGenerateResponse> {
+    const reader = response.body?.getReader();
+
+    if (!reader) {
+        throw new AIError(
+            'INVALID_RESPONSE',
+            'Gemini returned an empty streaming response.',
+            'gemini'
+        );
+    }
+
+    const decoder = new TextDecoder();
+
+    let buffer = '';
+    let dataLines: string[] = [];
+    let accumulatedText = '';
+
+    let mergedCandidate:
+        | {
+            content?: { parts?: GeminiPart[] };
+            finishReason?: string;
+        }
+        | undefined;
+
+    let promptFeedback: GeminiGenerateResponse['promptFeedback'];
+    let usageMetadata: GeminiGenerateResponse['usageMetadata'];
+    let modelVersion: string | undefined;
+
+    const dispatchEvent = (): void => {
+        if (dataLines.length === 0) {
+            return;
+        }
+
+        const payload = dataLines.join('\n');
+        dataLines = [];
+
+        if (!payload.trim() || payload.trim() === '[DONE]') {
+            return;
+        }
+
+        let event: GeminiGenerateResponse;
+
+        try {
+            event = JSON.parse(payload) as GeminiGenerateResponse;
+        } catch (error) {
+            throw new AIError(
+                'INVALID_RESPONSE',
+                'Gemini returned an invalid SSE event.',
+                'gemini',
+                undefined,
+                error
+            );
+        }
+
+        if (event.promptFeedback) {
+            promptFeedback = event.promptFeedback;
+        }
+
+        if (event.usageMetadata) {
+            usageMetadata = event.usageMetadata;
+        }
+
+        if (event.modelVersion) {
+            modelVersion = event.modelVersion;
+        }
+
+        const candidate = event.candidates?.[0];
+
+        if (!candidate) {
+            return;
+        }
+
+        mergedCandidate ??= {};
+
+        for (const part of candidate.content?.parts ?? []) {
+            if (part.thought || typeof part.text !== 'string') {
+                continue;
+            }
+
+            if (!part.text) {
+                continue;
+            }
+
+            accumulatedText += part.text;
+            onChunk(part.text);
+        }
+
+        if (candidate.finishReason) {
+            mergedCandidate.finishReason = candidate.finishReason;
+        }
+    };
+
+    const processLine = (line: string): void => {
+        if (line === '') {
+            dispatchEvent();
+            return;
+        }
+
+        // Ignore SSE comments and metadata fields.
+        if (line.startsWith(':')) {
+            return;
+        }
+
+        if (line.startsWith('data:')) {
+            let value = line.slice(5);
+
+            if (value.startsWith(' ')) {
+                value = value.slice(1);
+            }
+
+            dataLines.push(value);
+        }
+    };
+
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+
+            if (done) {
+                break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+
+            let newlineIndex: number;
+
+            while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                let line = buffer.slice(0, newlineIndex);
+                buffer = buffer.slice(newlineIndex + 1);
+
+                if (line.endsWith('\r')) {
+                    line = line.slice(0, -1);
+                }
+
+                processLine(line);
+            }
+        }
+
+        // Flush the decoder and process the final incomplete line.
+        buffer += decoder.decode();
+
+        if (buffer.length > 0) {
+            processLine(buffer.endsWith('\r') ? buffer.slice(0, -1) : buffer);
+        }
+
+        // Dispatch the final event if the stream doesn't end with a blank line.
+        dispatchEvent();
+    } finally {
+        reader.releaseLock();
+    }
+
+    return {
+        candidates: mergedCandidate
+            ? [{
+                content: {
+                    parts: accumulatedText
+                        ? [{ text: accumulatedText }]
+                        : []
+                },
+                finishReason: mergedCandidate.finishReason
+            }]
+            : undefined,
+        promptFeedback,
+        usageMetadata,
+        modelVersion
+    };
+}
+
 
 /** Gemini needs user/model roles and rejects back-to-back turns of the same role. */
 function toGeminiContents(messages: AIMessage[]): GeminiContent[] {
