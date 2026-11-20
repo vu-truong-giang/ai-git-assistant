@@ -241,8 +241,18 @@ export class AIService {
                         error
                     );
 
+                const totalDuration = Date.now() - started;
+
+                const firstChunkDuration = firstChunkAt !== undefined
+                    ? `${firstChunkAt - started} ms`
+                    : 'Not received';
+
                 this.log(
-                    `[${this.provider.id}] ${model} STREAM failed after ${Date.now() - started} ms: ${aiError.code} ${aiError.message}`
+                    `[${this.provider.id}] ${model} STREAM failed | ` +
+                    `total ${totalDuration} ms | ` +
+                    `first chunk ${firstChunkDuration} | ` +
+                    `chunks ${chunkCount} | ` +
+                    `error ${aiError.code}: ${aiError.message}`
                 );
 
                 const transient =
