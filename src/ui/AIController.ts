@@ -262,23 +262,42 @@ export class AIController implements vscode.Disposable {
     // ------------------------------------------------------------------
 
     async explainChanges(scope: GitDiffScope = 'auto'): Promise<void> {
+        let streamingStarted = false;
+
         const result = await this.runTask(
             'explain',
             'AI đang giải thích thay đổi...',
             'notification',
             signal => {
                 this.panel.startStreamingMarkdown('AI Explain Diff');
+                streamingStarted = true;
 
                 return this.explainFeature.explain(
                     scope,
                     signal,
                     chunk => this.panel.appendStreamingMarkdown(chunk)
                 );
+            },
+            {
+                onError: error => {
+                    if (!streamingStarted) return;
+
+                    const message =
+                        error instanceof AIError && error.code === 'CANCELLED'
+                            ? 'Yêu cầu AI đã bị hủy.'
+                            : error instanceof FeatureUnavailableError
+                                ? error.message
+                                : describeAIError(error);
+
+                    this.panel.showStreamingError(message);
+                }
             }
         );
 
         if (!result) {
-            this.panel.disposeIfLoading();
+            if (!streamingStarted) {
+                this.panel.disposeIfLoading();
+            }
             return;
         }
 
@@ -288,8 +307,7 @@ export class AIController implements vscode.Disposable {
             subtitle: `${scopeLabel(result.context)} · ${result.stats.files} file · +${result.stats.additions} −${result.stats.deletions} · ${this.ai.model}`,
             notes: contextNotes(result.context)
         });
-    }
-
+}
     async reviewChanges(scope: GitDiffScope = 'auto'): Promise<void> {
         this.panel.showLoading('AI Code Review', 'AI đang review code...');
         const result = await this.runTask('review', 'AI đang review code...', 'notification',
@@ -430,7 +448,10 @@ export class AIController implements vscode.Disposable {
         title: string,
         location: 'notification' | 'view',
         work: (signal: AbortSignal) => Promise<T>,
-        options: { needsConsent?: boolean } = {}
+        options: {
+            needsConsent?: boolean;
+            onError?: (error: unknown) => void;
+        } = {}
     ): Promise<T | undefined> {
         if (this.running.has(task)) {
             void vscode.window.showInformationMessage('Yêu cầu trước đó vẫn đang chạy, vui lòng đợi.');
@@ -455,6 +476,7 @@ export class AIController implements vscode.Disposable {
                 return work(controller.signal);
             });
         } catch (error) {
+             options.onError?.(error);
             await this.reportError(error);
             return undefined;
         } finally {

@@ -73,12 +73,33 @@ export class AIResultPanel {
         });
     }
 
+    finishStreamingMarkdown(): void {
+        if (!this.panel) {
+            return;
+        }
+
+        void this.panel.webview.postMessage({
+            command: 'streamComplete',
+            html: renderMarkdown(this.streamingMarkdown)
+        });
+    }
+
+
     showReview(title: string, review: CodeReviewResult, meta: PanelMeta = {}): void {
         this.render(title, `${header(title, meta)}${reviewHtml(review)}`, reviewToMarkdown(review));
     }
 
     showError(title: string, message: string): void {
         this.render(title, `<h1>${escapeHtml(title)}</h1><div class="error-box">${escapeHtml(message)}</div>`, message);
+    }
+    
+    showStreamingError(message: string): void {
+        if (!this.panel) return;
+
+        void this.panel.webview.postMessage({
+            command: 'streamError',
+            message
+        });
     }
 
     /** Closes the panel only if it is still showing a loading state for a cancelled task. */

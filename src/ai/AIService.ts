@@ -14,8 +14,13 @@ export interface AIServiceSettings {
 export interface AIServiceOptions {
     /** Extra attempts for transient failures (rate limit, network, 5xx). */
     maxRetries?: number;
-    /** Base delay of the exponential backoff between retries. */
+
+    /** Base delay of exponential backoff between retries. */
     retryDelayMs?: number;
+
+    /** Maximum random jitter added to each retry delay. */
+    retryJitterMs?: number;
+
     log?: (line: string) => void;
 }
 
@@ -34,6 +39,7 @@ export interface ConnectionTestResult {
 export class AIService {
     private readonly maxRetries: number;
     private readonly retryDelayMs: number;
+    private readonly retryJitterMs: number;
     private readonly log: (line: string) => void;
 
     constructor(
@@ -43,6 +49,7 @@ export class AIService {
     ) {
         this.maxRetries = options.maxRetries ?? 2;
         this.retryDelayMs = options.retryDelayMs ?? 1500;
+        this.retryJitterMs = options.retryJitterMs ?? 500;
         this.log = options.log ?? (() => undefined);
     }
 
@@ -104,7 +111,11 @@ export class AIService {
                 if (!transient || attempt >= this.maxRetries || options.signal?.aborted) {
                     throw aiError;
                 }
-                const wait = this.retryDelayMs * 2 ** attempt;
+                const wait = calculateRetryDelay(
+                    this.retryDelayMs,
+                    attempt,
+                    this.retryJitterMs
+                );
                 this.log(`[${this.provider.id}] retrying in ${wait} ms (attempt ${attempt + 2}/${this.maxRetries + 1})`);
                 try {
                     await delay(wait, options.signal);
@@ -285,4 +296,14 @@ export class AIService {
     async listModels(signal?: AbortSignal): Promise<string[]> {
         return this.provider.listModels ? this.provider.listModels(signal) : [];
     }
+}
+function calculateRetryDelay(
+    baseDelayMs: number,
+    attempt: number,
+    jitterMs: number
+): number {
+    const exponentialDelay = baseDelayMs * 2 ** attempt;
+    const jitter = Math.floor(Math.random() * (jitterMs + 1));
+
+    return exponentialDelay + jitter;
 }

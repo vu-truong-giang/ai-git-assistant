@@ -54,6 +54,25 @@ main {
     background: var(--vscode-button-secondaryHoverBackground);
 }
 
+.button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 2px;
+}
+
+.button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 2px;
+}
 h1 {
     margin: 4px 0 4px;
     font-size: 1.5em;
@@ -158,11 +177,14 @@ a {
     }
 }
 
+
 .error-box {
     padding: 10px 14px;
     border: 1px solid var(--critical);
     border-radius: 6px;
     color: var(--critical);
+    background: color-mix(in srgb, var(--critical) 8%, transparent);
+    line-height: 1.5;
 }
 
 .review-summary {
