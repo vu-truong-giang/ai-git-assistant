@@ -262,14 +262,28 @@ export class AIController implements vscode.Disposable {
     // ------------------------------------------------------------------
 
     async explainChanges(scope: GitDiffScope = 'auto'): Promise<void> {
-        this.panel.showLoading('AI Explain Diff', 'AI đang phân tích thay đổi...');
-        const result = await this.runTask('explain', 'AI đang giải thích thay đổi...', 'notification',
-            signal => this.explainFeature.explain(scope, signal));
+        const result = await this.runTask(
+            'explain',
+            'AI đang giải thích thay đổi...',
+            'notification',
+            signal => {
+                this.panel.startStreamingMarkdown('AI Explain Diff');
+
+                return this.explainFeature.explain(
+                    scope,
+                    signal,
+                    chunk => this.panel.appendStreamingMarkdown(chunk)
+                );
+            }
+        );
+
         if (!result) {
             this.panel.disposeIfLoading();
             return;
         }
+
         this.logContext('explain', result.context);
+
         this.panel.showMarkdown('AI Explain Diff', result.markdown, {
             subtitle: `${scopeLabel(result.context)} · ${result.stats.files} file · +${result.stats.additions} −${result.stats.deletions} · ${this.ai.model}`,
             notes: contextNotes(result.context)

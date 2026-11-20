@@ -22,6 +22,9 @@ interface PanelMessage {
 export class AIResultPanel {
     private panel?: vscode.WebviewPanel;
     private copyText = '';
+    private streamingMarkdown = '';
+    private streamingTitle = '';
+    private streamingMeta: PanelMeta = {};
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -34,6 +37,40 @@ export class AIResultPanel {
 
     showMarkdown(title: string, markdown: string, meta: PanelMeta = {}): void {
         this.render(title, `${header(title, meta)}<article class="markdown">${renderMarkdown(markdown)}</article>`, markdown);
+    }
+        /**
+     * Starts a new streaming Markdown result.
+     */
+    startStreamingMarkdown(title: string, meta: PanelMeta = {}): void {
+        this.streamingMarkdown = '';
+        this.streamingTitle = title;
+        this.streamingMeta = meta;
+
+        this.render(
+            title,
+            `${header(title, meta)}
+            <article class="markdown">${renderMarkdown('Đang chờ AI phản hồi...')}</article>`,
+            ''
+        );
+    }
+
+    appendStreamingMarkdown(chunk: string): void {
+        if (!chunk) {
+            return;
+        }
+
+        // Ghép chunk mới vào nội dung hiện tại.
+        this.streamingMarkdown += chunk;
+
+        // Cập nhật nội dung Copy.
+        this.copyText = this.streamingMarkdown;
+
+        // Chỉ gửi phần HTML đã render sang Webview.
+        // Không gọi render() vì render() sẽ tải lại toàn bộ Webview.
+        void this.panel?.webview.postMessage({
+            command: 'streamUpdate',
+            html: renderMarkdown(this.streamingMarkdown)
+        });
     }
 
     showReview(title: string, review: CodeReviewResult, meta: PanelMeta = {}): void {
@@ -103,7 +140,14 @@ export class AIResultPanel {
 <title>AI Result</title>
 </head>
 <body>
-<div class="toolbar">${this.copyText ? '<button class="button" data-action="copy" type="button">⧉ Copy</button>' : ''}</div>
+<div class="toolbar">
+    <button
+        class="button"
+        data-action="copy"
+        type="button"
+        ${this.copyText ? '' : 'disabled'}
+    >⧉ Copy</button>
+</div>
 <main>${bodyHtml}</main>
 <script nonce="${nonce}" src="${js}"></script>
 </body>

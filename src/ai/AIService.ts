@@ -158,6 +158,8 @@ export class AIService {
 
         for (let attempt = 0; ; attempt++) {
             const started = Date.now();
+            let firstChunkAt: number | undefined;
+            let chunkCount = 0;
             let emittedChunk = false;
             let callbackFailed = false;
 
@@ -175,6 +177,15 @@ export class AIService {
                         try {
                             if (chunk.length > 0) {
                                 emittedChunk = true;
+                                chunkCount++;
+
+                                if (firstChunkAt === undefined) {
+                                    firstChunkAt = Date.now();
+
+                                    this.log(
+                                        `[${this.provider.id}] First chunk received after ${firstChunkAt - started} ms`
+                                    );
+                                }
                             }
 
                             onChunk(chunk);
@@ -189,8 +200,17 @@ export class AIService {
                     ? `, tokens in/out ${response.usage.inputTokens}/${response.usage.outputTokens}`
                     : '';
 
+               const totalDuration = Date.now() - started;
+                const firstChunkDuration = firstChunkAt !== undefined
+                    ? `${firstChunkAt - started} ms`
+                    : 'No chunk received';
+
                 this.log(
-                    `[${this.provider.id}] ${response.model} STREAM OK in ${Date.now() - started} ms (prompt ${promptChars} chars${usage})`
+                    `[${this.provider.id}] ${response.model} STREAM OK | ` +
+                    `total ${totalDuration} ms | ` +
+                    `first chunk ${firstChunkDuration} | ` +
+                    `chunks ${chunkCount} | ` +
+                    `prompt ${promptChars} chars${usage}`
                 );
 
                 return response;
