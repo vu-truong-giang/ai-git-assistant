@@ -17,6 +17,36 @@ async function expectAIError(promise: Promise<unknown>, code: AIError['code']): 
     assert.fail(`expected AIError ${code}`);
 }
 
+function sseResponse(events: unknown[]): Response {
+    const data = events
+        .map(event => `data: ${JSON.stringify(event)}\n\n`)
+        .join('');
+
+    return new Response(data, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+    });
+}
+
+function sseResponseFromChunks(chunks: string[]): Response {
+    const encoder = new TextEncoder();
+
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const chunk of chunks) {
+                controller.enqueue(encoder.encode(chunk));
+            }
+            controller.close();
+        }
+    });
+
+    return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+    });
+}
+
+
 describe('GeminiProvider (TASK 7.2)', () => {
     it('maps messages to Gemini format: system instruction, model role, merged turns, JSON mode', () => {
         const provider = new GeminiProvider(key);
@@ -133,6 +163,256 @@ describe('GeminiProvider (TASK 7.2)', () => {
         const notJson = fakeFetch([new Response('<html>proxy error</html>', { status: 200 })]);
         await expectAIError(new GeminiProvider(key, notJson.fn).generate({ messages: [{ role: 'user', content: 'x' }] }), 'INVALID_RESPONSE');
     });
+
+
+    it('streams multiple chunks and returns the complete AIResponse', async () => {
+        const stub = fakeFetch([
+            sseResponse([
+                {
+                    candidates: [{
+                        content: { parts: [{ text: 'Hello ' }] }
+                    }]
+                },
+                {
+                    candidates: [{
+                        content: { parts: [{ text: 'World' }] },
+                        finishReason: 'STOP'
+                    }],
+                    modelVersion: 'gemini-test-001',
+                    usageMetadata: {
+                        promptTokenCount: 10,
+                        candidatesTokenCount: 5,
+                        totalTokenCount: 15
+                    }
+                }
+            ])
+        ]);
+
+        const provider = new GeminiProvider(
+            key,
+            stub.fn,
+            'https://example.test/v1beta'
+        );
+
+        const chunks: string[] = [];
+
+        const response = await provider.generateStream(
+            {
+                messages: [{ role: 'user', content: 'Say hello' }],
+                options: { model: 'gemini-x' }
+            },
+            chunk => chunks.push(chunk)
+        );
+
+        assert.deepEqual(chunks, ['Hello ', 'World']);
+        assert.equal(response.text, 'Hello World');
+        assert.equal(response.model, 'gemini-test-001');
+        assert.equal(response.finishReason, 'stop');
+
+        assert.deepEqual(response.usage, {
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15
+        });
+
+        assert.equal(
+            stub.calls[0].url,
+            'https://example.test/v1beta/models/gemini-x:streamGenerateContent?alt=sse'
+        );
+
+        const headers = stub.calls[0].init.headers as Record<string, string>;
+
+        assert.equal(headers['x-goog-api-key'], 'AIza-test-key');
+        assert.equal(headers['Accept'], 'text/event-stream');
+    });
+
+    
+    it('ignores thought parts while streaming', async () => {
+        const stub = fakeFetch([
+            sseResponse([
+                {
+                    candidates: [{
+                        content: {
+                            parts: [
+                                { text: 'Internal reasoning', thought: true },
+                                { text: 'Actual answer' }
+                            ]
+                        },
+                        finishReason: 'STOP'
+                    }]
+                }
+            ])
+        ]);
+
+        const chunks: string[] = [];
+
+        const response = await new GeminiProvider(key, stub.fn).generateStream(
+            { messages: [{ role: 'user', content: 'Explain this' }] },
+            chunk => chunks.push(chunk)
+        );
+
+        assert.deepEqual(chunks, ['Actual answer']);
+        assert.equal(response.text, 'Actual answer');
+    });
+
+
+    it('handles SSE data split across multiple network chunks', async () => {
+        const event = `data: ${JSON.stringify({
+            candidates: [{
+                content: { parts: [{ text: 'Split response' }] },
+                finishReason: 'STOP'
+            }]
+        })}\n\n`;
+
+        const splitAt = event.indexOf('"text"') + 4;
+
+        const stub = fakeFetch([
+            sseResponseFromChunks([
+                event.slice(0, splitAt),
+                event.slice(splitAt)
+            ])
+        ]);
+
+        const chunks: string[] = [];
+
+        const response = await new GeminiProvider(key, stub.fn).generateStream(
+            { messages: [{ role: 'user', content: 'Test splitting' }] },
+            chunk => chunks.push(chunk)
+        );
+
+        assert.equal(response.text, 'Split response');
+        assert.deepEqual(chunks, ['Split response']);
+    });
+
+
+    it('rejects malformed SSE JSON with INVALID_RESPONSE', async () => {
+        const stub = fakeFetch([
+            new Response('data: {invalid-json}\n\n', {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            })
+        ]);
+
+        await expectAIError(
+            new GeminiProvider(key, stub.fn).generateStream(
+                { messages: [{ role: 'user', content: 'Test malformed SSE' }] },
+                () => {}
+            ),
+            'INVALID_RESPONSE'
+        );
+    });
+
+    
+    it('reports a missing API key for streaming without calling the network', async () => {
+        const stub = fakeFetch([]);
+
+        const provider = new GeminiProvider(
+            async () => undefined,
+            stub.fn
+        );
+
+        await expectAIError(
+            provider.generateStream(
+                { messages: [{ role: 'user', content: 'Hello' }] },
+                () => {}
+            ),
+            'MISSING_API_KEY'
+        );
+
+        assert.equal(stub.calls.length, 0);
+    });
+
+
+    
+    it('maps streaming HTTP 429 to RATE_LIMITED', async () => {
+        const stub = fakeFetch([
+            json({
+                error: {
+                    code: 429,
+                    message: 'Quota exceeded',
+                    status: 'RESOURCE_EXHAUSTED'
+                }
+            }, 429)
+        ]);
+
+        const error = await expectAIError(
+            new GeminiProvider(key, stub.fn).generateStream(
+                { messages: [{ role: 'user', content: 'Hello' }] },
+                () => {}
+            ),
+            'RATE_LIMITED'
+        );
+
+        assert.equal(error.statusCode, 429);
+    });
+
+    it('reports cancellation while reading the streaming response', async () => {
+        const hang = (init: RequestInit) => {
+            const body = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    init.signal?.addEventListener('abort', () => {
+                        controller.error(new DOMException('aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+
+            return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            }));
+        };
+
+        const controller = new AbortController();
+        const stub = fakeFetch([hang]);
+
+        const pending = new GeminiProvider(key, stub.fn).generateStream(
+            {
+                messages: [{ role: 'user', content: 'Hello' }],
+                options: {
+                    signal: controller.signal,
+                    timeoutMs: 5000
+                }
+            },
+            () => {}
+        );
+
+        setTimeout(() => controller.abort(), 10);
+
+        await expectAIError(pending, 'CANCELLED');
+    });
+
+
+    it('times out while reading the streaming response', async () => {
+        const hang = (init: RequestInit) => {
+            const body = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    init.signal?.addEventListener('abort', () => {
+                        controller.error(new DOMException('aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+
+            return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            }));
+        };
+
+        const stub = fakeFetch([hang]);
+
+        await expectAIError(
+            new GeminiProvider(key, stub.fn).generateStream(
+                {
+                    messages: [{ role: 'user', content: 'Hello' }],
+                    options: { timeoutMs: 30 }
+                },
+                () => {}
+            ),
+            'TIMEOUT'
+        );
+    });
+
+    
 
     it('lists only Gemini models that support generateContent', async () => {
         const stub = fakeFetch([json({
