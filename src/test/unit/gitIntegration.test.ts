@@ -151,7 +151,10 @@ describe('Git context + AI features on a real repository', () => {
         assert.match(prompt, /Conventional Commits/);
         assert.match(prompt, /src\/untracked\.ts/);
         assert.ok(!prompt.includes('src/config.ts'), 'unstaged files must not be in a staged commit prompt');
-        assert.match(prompt, /chore: add config/, 'recent commits are given as style reference');
+        assert.ok(
+            !prompt.includes('chore: add config'),
+            'recent commit history must not be included in the V2 commit message prompt'
+        );    
     });
 
     it('EPIC 09: refuses when nothing is staged', async () => {

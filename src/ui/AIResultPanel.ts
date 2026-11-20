@@ -25,6 +25,7 @@ export class AIResultPanel {
     private streamingMarkdown = '';
     private streamingTitle = '';
     private streamingMeta: PanelMeta = {};
+    private isStreaming = false;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -45,6 +46,7 @@ export class AIResultPanel {
         this.streamingMarkdown = '';
         this.streamingTitle = title;
         this.streamingMeta = meta;
+        this.isStreaming = true;
 
         this.render(
             title,
@@ -55,19 +57,14 @@ export class AIResultPanel {
     }
 
     appendStreamingMarkdown(chunk: string): void {
-        if (!chunk) {
+        if (!this.isStreaming || !this.panel || !chunk) {
             return;
         }
 
-        // Ghép chunk mới vào nội dung hiện tại.
         this.streamingMarkdown += chunk;
-
-        // Cập nhật nội dung Copy.
         this.copyText = this.streamingMarkdown;
 
-        // Chỉ gửi phần HTML đã render sang Webview.
-        // Không gọi render() vì render() sẽ tải lại toàn bộ Webview.
-        void this.panel?.webview.postMessage({
+        void this.panel.webview.postMessage({
             command: 'streamUpdate',
             html: renderMarkdown(this.streamingMarkdown)
         });
@@ -96,17 +93,23 @@ export class AIResultPanel {
     showStreamingError(message: string): void {
         if (!this.panel) return;
 
+        // Không cho phép copy kết quả Streaming chưa hoàn chỉnh.
+        this.copyText = '';
+
         void this.panel.webview.postMessage({
             command: 'streamError',
             message
         });
     }
-
     /** Closes the panel only if it is still showing a loading state for a cancelled task. */
     disposeIfLoading(): void {
         if (this.panel && this.copyText === '') {
             this.panel.dispose();
         }
+    }
+    dispose(): void {
+        this.panel?.dispose();
+        this.panel = undefined;
     }
 
     private render(title: string, bodyHtml: string, copyText: string): void {
@@ -138,8 +141,15 @@ export class AIResultPanel {
 
     private async onMessage(message: PanelMessage): Promise<void> {
         if (message.command === 'copy') {
+            if (!this.copyText) {
+                return;
+            }
+
             await vscode.env.clipboard.writeText(this.copyText);
-            void vscode.window.showInformationMessage('Đã copy kết quả vào clipboard.');
+
+            void vscode.window.showInformationMessage(
+                'Đã copy kết quả vào clipboard.'
+            );
         } else if (message.command === 'openFile' && message.file) {
             const line = message.line ? Number(message.line) : undefined;
             await this.openFileAt(message.file, Number.isInteger(line) ? line : undefined);

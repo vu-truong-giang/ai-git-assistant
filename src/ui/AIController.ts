@@ -128,6 +128,8 @@ export class AIController implements vscode.Disposable {
         for (const controller of this.running.values()) {
             controller.abort();
         }
+
+        this.panel.dispose();
         this.disposables.forEach(disposable => disposable.dispose());
     }
 

@@ -267,6 +267,62 @@ describe('AIService (TASK 7.3 / 7.5 / 7.6)', () => {
 
         assert.equal(provider.requests[0].options?.timeoutMs, 5000);
     });
+    
+    it('adds jitter to the retry delay', async () => {
+        const logs: string[] = [];
+
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'Temporary network error', 'fake'),
+            'success'
+        ]);
+
+        const service = new AIService(
+            provider,
+            settings(),
+            {
+                retryDelayMs: 2000,
+                retryJitterMs: 500,
+                random: () => 0.5,
+                log: line => logs.push(line)
+            }
+        );
+
+        const response = await service.generate([
+            { role: 'user', content: 'Hello' }
+        ]);
+
+        assert.equal(response.text, 'success');
+        assert.equal(provider.requests.length, 2);
+        assert.ok(logs.some(line => line.includes('2250 ms')));
+    });
+
+    it('uses exponential backoff without jitter when jitter is zero', async () => {
+        const logs: string[] = [];
+
+        const provider = new FakeProvider([
+            new AIError('NETWORK', 'Temporary network error', 'fake'),
+            'success'
+        ]);
+
+        const service = new AIService(
+            provider,
+            settings(),
+            {
+                retryDelayMs: 2000,
+                retryJitterMs: 0,
+                random: () => 0.5,
+                log: line => logs.push(line)
+            }
+        );
+
+        const response = await service.generate([
+            { role: 'user', content: 'Hello' }
+        ]);
+
+        assert.equal(response.text, 'success');
+        assert.equal(provider.requests.length, 2);
+        assert.ok(logs.some(line => line.includes('2000 ms')));
+    });
 
 });
 

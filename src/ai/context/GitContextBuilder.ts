@@ -5,12 +5,23 @@ import { ICommitService } from '../../git/interfaces/CommitService.interface';
 import { IBranchService } from '../../git/interfaces/IGitBranchService';
 import { IStatusService } from '../../git/interfaces/IGitStatusService';
 import { GitFileStatus } from '../../git/models/GitFileStatus.model';
-import { limitDiff } from './ContextLimiter';
 import { computeDiffStats, formatFileSummary } from './diffUtils';
 import { GitContext, GitContextCommit, GitContextRequest } from './GitContext.model';
+import { AIError } from '../models/AIError.model';
+import {
+    SENSITIVE_FILE_PATTERNS,
+    DEFAULT_EXCLUDE_PATTERNS,
+    limitDiff
+} from './ContextLimiter';
+import { matchesAnyGlob } from './glob';
+import { GitCommandOptions } from '../../git/executor/GitCommandExecutor';
 
-const MAX_UNTRACKED_FILES = 25;
-const MAX_UNTRACKED_FILE_BYTES = 64 * 1024;
+
+const MAX_UNTRACKED_FILES = 10;
+const MAX_UNTRACKED_FILE_BYTES = 16 * 1024;
+const MAX_UNTRACKED_TOTAL_BYTES = 128 * 1024;
+const GIT_DIFF_TIMEOUT_MS = 15_000;
+const MAX_GIT_DIFF_BYTES = 1_500_000;
 
 export type ReadWorkspaceFile = (relativePath: string) => Promise<Buffer | undefined>;
 
@@ -32,53 +43,121 @@ export class GitContextBuilder {
         this.readFile = readFile ?? (relativePath => readInsideRoot(workspaceRoot, relativePath));
     }
 
-    async build(request: GitContextRequest): Promise<GitContext> {
-        // Independent git calls run in parallel.
-        const [files, branchInfo, commits] = await Promise.all([
-            this.status.getStatus(),
-            this.branch.getCurrentBranch().catch(() => undefined),
-            request.historyLimit
-                ? this.commit.getHistory(request.historyLimit, request.historyRange).catch(() => [])
-                : Promise.resolve([])
-        ]);
+    
+    async build(
+        request: GitContextRequest,
+        signal?: AbortSignal
+    ): Promise<GitContext> {
+        this.throwIfAborted(signal);
 
-        const { scope, range, rawDiff } = await this.collectDiff(request, files);
-        const diff = limitDiff(rawDiff, {
-            maxChars: request.maxChars,
-            excludePatterns: request.excludePatterns,
-            redactSecrets: request.redactSecrets
-        });
+        const contextStarted = Date.now();
 
-        const recentCommits: GitContextCommit[] = commits.map(commit => ({
-            shortHash: commit.shortHash,
-            message: commit.message,
-            author: commit.author.name,
-            date: isNaN(commit.date.getTime()) ? '' : commit.date.toISOString().slice(0, 10)
-        }));
+        try {
+            const [files, branchInfo, commits] = await Promise.all([
+                this.status.getStatus(),
+                this.branch.getCurrentBranch().catch(() => undefined),
+                request.historyLimit
+                    ? this.commit.getHistory(
+                        request.historyLimit,
+                        request.historyRange
+                    ).catch(() => [])
+                    : Promise.resolve([])
+            ]);
 
-        return {
-            branch: branchInfo?.name ?? 'HEAD',
-            trackingBranch: branchInfo?.tracking,
-            ahead: branchInfo?.ahead ?? 0,
-            behind: branchInfo?.behind ?? 0,
-            files,
-            diffScope: scope,
-            range,
-            diff,
-            recentCommits
-        };
+            this.throwIfAborted(signal);
+
+            const { scope, range, rawDiff } = await this.collectDiff(
+                request,
+                files,
+                signal
+            );
+
+            this.throwIfAborted(signal);
+
+            const diff = limitDiff(rawDiff, {
+                maxChars: request.maxChars,
+                excludePatterns: request.excludePatterns,
+                redactSecrets: request.redactSecrets
+            });
+
+            const recentCommits: GitContextCommit[] = commits.map(commit => ({
+                shortHash: commit.shortHash,
+                message: commit.message,
+                author: commit.author.name,
+                date: isNaN(commit.date.getTime())
+                    ? ''
+                    : commit.date.toISOString().slice(0, 10)
+            }));
+
+            console.log(
+                `[GitContextBuilder] Built context in ${Date.now() - contextStarted} ms; ` +
+                `${rawDiff.length} raw chars, ${diff.text.length} context chars`
+            );
+
+            return {
+                branch: branchInfo?.name ?? 'HEAD',
+                trackingBranch: branchInfo?.tracking,
+                ahead: branchInfo?.ahead ?? 0,
+                behind: branchInfo?.behind ?? 0,
+                files,
+                diffScope: scope,
+                range,
+                diff,
+                recentCommits
+            };
+        } catch (error) {
+            if (signal?.aborted || isAbortError(error)) {
+                throw new AIError(
+                    'CANCELLED',
+                    'The Git context collection was cancelled.',
+                    'git',
+                    undefined,
+                    error
+                );
+            }
+
+            throw error;
+        }
     }
 
+private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        throw new AIError(
+            'CANCELLED',
+            'The Git context collection was cancelled.',
+            'git'
+        );
+    }
+}
+
+
+    
     private async collectDiff(
         request: GitContextRequest,
-        files: GitFileStatus[]
-    ): Promise<{ scope: GitContext['diffScope']; range?: string; rawDiff: string }> {
+        files: GitFileStatus[],
+        signal?: AbortSignal
+    ): Promise<{
+        scope: GitContext['diffScope'];
+        range?: string;
+        rawDiff: string;
+    }> {
         const requested = request.diff;
+
         if (requested === 'none') {
             return { scope: 'none', rawDiff: '' };
         }
+
         if (typeof requested === 'object') {
-            return { scope: 'range', range: requested.range, rawDiff: await this.diff.getRawDiff({ range: requested.range }) };
+            const rawDiff = await this.diff.getRawDiff(
+                { range: requested.range },
+                this.gitExecutionOptions(signal)
+            );
+
+            return {
+                scope: 'range',
+                range: requested.range,
+                rawDiff
+            };
         }
 
         const scope = requested === 'auto'
@@ -86,45 +165,188 @@ export class GitContextBuilder {
             : requested;
 
         if (scope === 'staged') {
-            return { scope, rawDiff: await this.diff.getRawDiff({ staged: true }) };
+            const rawDiff = await this.diff.getRawDiff(
+                { staged: true },
+                this.gitExecutionOptions(signal)
+            );
+
+            return { scope, rawDiff };
         }
 
         let tracked: string;
+
         if (scope === 'working') {
-            tracked = await this.diff.getRawDiff();
-        } else {
-            // Working tree vs HEAD; a repository without commits has no HEAD yet.
-            tracked = await this.diff.getRawDiff({ range: 'HEAD' }).catch(async () =>
-                (await this.diff.getRawDiff({ staged: true })) + (await this.diff.getRawDiff())
+            tracked = await this.diff.getRawDiff(
+                {},
+                this.gitExecutionOptions(signal)
             );
+        } else {
+            try {
+                // HEAD diff includes staged and unstaged tracked changes.
+                tracked = await this.diff.getRawDiff(
+                    { range: 'HEAD' },
+                    this.gitExecutionOptions(signal)
+                );
+            } catch (error) {
+                // Only fall back for a repository without its first commit.
+                // Never hide timeout, cancellation or output-limit errors.
+                if (!isUnbornHeadError(error)) {
+                    throw error;
+                }
+
+                const [staged, working] = await Promise.all([
+                    this.diff.getRawDiff(
+                        { staged: true },
+                        this.gitExecutionOptions(signal)
+                    ),
+                    this.diff.getRawDiff(
+                        {},
+                        this.gitExecutionOptions(signal)
+                    )
+                ]);
+
+                tracked = staged + working;
+            }
         }
-        const untracked = await this.untrackedAsDiff(files);
-        return { scope, rawDiff: tracked + untracked };
+
+        this.throwIfAborted(signal);
+
+        const untracked = await this.untrackedAsDiff(
+            files,
+            request.excludePatterns,
+            signal
+        );
+
+        return {
+            scope,
+            rawDiff: tracked + untracked
+        };
     }
 
+private gitExecutionOptions(signal?: AbortSignal): GitCommandOptions {
+    return {
+        timeoutMs: GIT_DIFF_TIMEOUT_MS,
+        maxOutputBytes: MAX_GIT_DIFF_BYTES,
+        signal
+    };
+}
+
+
     /** git diff ignores untracked files, so render them as "new file" diffs. */
-    private async untrackedAsDiff(files: GitFileStatus[]): Promise<string> {
-        const untracked = files.filter(file => file.status === 'untracked').slice(0, MAX_UNTRACKED_FILES);
-        const blocks = await Promise.all(untracked.map(async file => {
+    
+    private async untrackedAsDiff(
+        files: GitFileStatus[],
+        customExcludePatterns?: readonly string[],
+        signal?: AbortSignal
+    ): Promise<string> {
+        const excluded = [
+            ...DEFAULT_EXCLUDE_PATTERNS,
+            ...(customExcludePatterns ?? [])
+        ];
+
+        const candidates = files
+            .filter(file => file.status === 'untracked')
+            .slice(0, MAX_UNTRACKED_FILES);
+
+        const blocks: string[] = [];
+        let remainingBytes = MAX_UNTRACKED_TOTAL_BYTES;
+
+        for (const file of candidates) {
+            this.throwIfAborted(signal);
+
             const filePath = file.filePath.replace(/^"|"$/g, '');
-            const header = `diff --git a/${filePath} b/${filePath}\nnew file mode 100644\n`;
+            const header =
+                `diff --git a/${filePath} b/${filePath}\n` +
+                'new file mode 100644\n';
+
+            if (
+                matchesAnyGlob(filePath, SENSITIVE_FILE_PATTERNS)
+            ) {
+                blocks.push(
+                    `${header}[content omitted: sensitive file]\n`
+                );
+                continue;
+            }
+
+            if (matchesAnyGlob(filePath, excluded)) {
+                blocks.push(
+                    `${header}[content omitted: generated/lock file]\n`
+                );
+                continue;
+            }
+
             if (filePath.endsWith('/')) {
-                return `${header}[untracked folder; contents not listed]\n`;
+                blocks.push(
+                    `${header}[untracked folder; contents not listed]\n`
+                );
+                continue;
             }
-            const content = await this.readFile(filePath).catch(() => undefined);
+
+            if (remainingBytes <= 0) {
+                blocks.push(
+                    `${header}[content omitted: untracked context budget reached]\n`
+                );
+                continue;
+            }
+
+            let content: Buffer | undefined;
+
+            try {
+                content = await this.readFile(filePath);
+            } catch {
+                content = undefined;
+            }
+
+            this.throwIfAborted(signal);
+
             if (!content) {
-                return `${header}[untracked file could not be read]\n`;
+                blocks.push(
+                    `${header}[untracked file could not be read]\n`
+                );
+                continue;
             }
+
             if (content.includes(0)) {
-                return `${header}Binary files /dev/null and b/${filePath} differ\n`;
+                blocks.push(
+                    `${header}Binary files /dev/null and b/${filePath} differ\n`
+                );
+                continue;
             }
-            const text = content.subarray(0, MAX_UNTRACKED_FILE_BYTES).toString('utf8').replace(/\r\n/g, '\n');
-            const lines = text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n');
-            const cut = content.length > MAX_UNTRACKED_FILE_BYTES ? '\n... [file larger than 64 KB, rest not shown]' : '';
-            return `${header}--- /dev/null\n+++ b/${filePath}\n@@ -0,0 +1,${lines.length} @@\n${lines.map(line => `+${line}`).join('\n')}${cut}\n`;
-        }));
+
+            const allowedBytes = Math.min(
+                MAX_UNTRACKED_FILE_BYTES,
+                remainingBytes
+            );
+
+            const truncated = content.length > allowedBytes;
+            const text = content
+                .subarray(0, allowedBytes)
+                .toString('utf8')
+                .replace(/\r\n/g, '\n');
+
+            remainingBytes -= Math.min(content.length, allowedBytes);
+
+            const lines = text.endsWith('\n')
+                ? text.slice(0, -1).split('\n')
+                : text.split('\n');
+
+            const cut = truncated
+                ? '\n... [untracked file truncated]\n'
+                : '';
+
+            blocks.push(
+                `${header}` +
+                `--- /dev/null\n` +
+                `+++ b/${filePath}\n` +
+                `@@ -0,0 +1,${lines.length} @@\n` +
+                `${lines.map(line => `+${line}`).join('\n')}` +
+                `${cut}\n`
+            );
+        }
+
         return blocks.join('');
     }
+
 }
 
 /** Renders the context as Markdown sections for a prompt. */
@@ -175,15 +397,61 @@ export function formatGitContext(
     return sections.join('\n\n');
 }
 
-async function readInsideRoot(root: string, relativePath: string): Promise<Buffer | undefined> {
+
+async function readInsideRoot(
+    root: string,
+    relativePath: string
+): Promise<Buffer | undefined> {
     const absolute = path.resolve(root, relativePath);
-    const relative = path.relative(root, absolute);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+
+    const realRoot = await fs.realpath(root);
+    const realFile = await fs.realpath(absolute);
+    const relative = path.relative(realRoot, realFile);
+
+    // Prevent both lexical traversal and symlink escape.
+    if (
+        relative.startsWith('..') ||
+        path.isAbsolute(relative)
+    ) {
         return undefined;
     }
-    const stat = await fs.stat(absolute);
+
+    const stat = await fs.stat(realFile);
+
     if (!stat.isFile()) {
         return undefined;
     }
-    return fs.readFile(absolute);
+
+    const handle = await fs.open(realFile, 'r');
+
+    try {
+        const buffer = Buffer.alloc(
+            Math.min(stat.size, MAX_UNTRACKED_FILE_BYTES + 1)
+        );
+
+        const { bytesRead } = await handle.read(
+            buffer,
+            0,
+            buffer.length,
+            0
+        );
+
+        return buffer.subarray(0, bytesRead);
+    } finally {
+        await handle.close();
+    }
 }
+
+function isAbortError(error: unknown): boolean {
+    return error instanceof Error && error.name === 'AbortError';
+}
+
+function isUnbornHeadError(error: unknown): boolean {
+    const message = error instanceof Error
+        ? error.message
+        : String(error);
+
+    return /ambiguous argument ['"]?HEAD|unknown revision|bad revision|needed a single revision|not a valid object name/i
+        .test(message);
+}
+

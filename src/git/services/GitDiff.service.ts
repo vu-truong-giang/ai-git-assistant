@@ -1,7 +1,7 @@
 import { IDiffService } from '../interfaces/DiffService.interface';
 import { GitDiff, GitDiffChange, GitDiffChangeType, GitRawDiffOptions } from '../models/GitDiff.model';
 import { GitCommandExecutor } from '../executor/GitCommandExecutor';
-
+import { GitCommandOptions } from '../executor/GitCommandExecutor';
 export class GitDiffService implements IDiffService {
     constructor(private executor: GitCommandExecutor) {}
 
@@ -59,13 +59,18 @@ export class GitDiffService implements IDiffService {
     }
 
 
-    async getRawDiff(options: GitRawDiffOptions = {}): Promise<string> {
+    
+    async getRawDiff(
+        options: GitRawDiffOptions = {},
+        execution: GitCommandOptions = {}
+    ): Promise<string> {
         const args = [
             'diff',
             '--no-color',
             '--no-ext-diff',
             `--unified=${options.contextLines ?? 3}`
         ];
+
         if (options.staged) {
             args.push('--staged');
         } else if (options.range) {
@@ -74,12 +79,20 @@ export class GitDiffService implements IDiffService {
             }
             args.push(options.range);
         }
+
         args.push('--');
+
         if (options.filePath) {
             args.push(options.filePath);
         }
-        return this.executor.execute(args);
+
+        return this.executor.execute(args, undefined, undefined, {
+            timeoutMs: execution.timeoutMs ?? 15_000,
+            maxOutputBytes: execution.maxOutputBytes ?? 1_500_000,
+            signal: execution.signal
+        });
     }
+
 
     private parseDiffOutput(output: string): GitDiff[] {
         const diffs: GitDiff[] = [];

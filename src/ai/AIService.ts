@@ -15,11 +15,14 @@ export interface AIServiceOptions {
     /** Extra attempts for transient failures (rate limit, network, 5xx). */
     maxRetries?: number;
 
-    /** Base delay of exponential backoff between retries. */
+    /** Base delay of the exponential backoff between retries. */
     retryDelayMs?: number;
 
-    /** Maximum random jitter added to each retry delay. */
+    /** Random additional delay to prevent synchronized retries. */
     retryJitterMs?: number;
+
+    /** Injectable random source, mainly for deterministic tests. */
+    random?: () => number;
 
     log?: (line: string) => void;
 }
@@ -40,6 +43,7 @@ export class AIService {
     private readonly maxRetries: number;
     private readonly retryDelayMs: number;
     private readonly retryJitterMs: number;
+    private readonly random: () => number;
     private readonly log: (line: string) => void;
 
     constructor(
@@ -47,9 +51,10 @@ export class AIService {
         private readonly getSettings: () => AIServiceSettings,
         options: AIServiceOptions = {}
     ) {
-        this.maxRetries = options.maxRetries ?? 2;
-        this.retryDelayMs = options.retryDelayMs ?? 1500;
-        this.retryJitterMs = options.retryJitterMs ?? 500;
+        this.maxRetries = Math.max(0, options.maxRetries ?? 2);
+        this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 2000);
+        this.retryJitterMs = Math.max(0, options.retryJitterMs ?? 500);
+        this.random = options.random ?? Math.random;
         this.log = options.log ?? (() => undefined);
     }
 
@@ -75,7 +80,11 @@ export class AIService {
 
     async generate(
         messages: AIMessage[],
-        options: Omit<AIRequestOptions, 'model' | 'timeoutMs'> & { timeoutMs?: number } = {}
+        
+        options: Omit<AIRequestOptions, 'model' | 'timeoutMs'> & {
+            timeoutMs?: number;
+            maxRetries?: number;
+        } = {}
     ): Promise<AIResponse> {
         const settings = this.getSettings();
         if (!settings.enabled) {
@@ -85,45 +94,92 @@ export class AIService {
             throw new AIError('MISSING_API_KEY', 'No API key has been set.', this.provider.id);
         }
 
-        const model = this.model;
-        const promptChars = messages.reduce((sum, message) => sum + message.content.length, 0);
+        
+const {
+    maxRetries: requestMaxRetries,
+    ...providerOptions
+} = options;
 
-        for (let attempt = 0; ; attempt++) {
-            const started = Date.now();
-            try {
-                const response = await this.provider.generate({
-                    messages,
-                    options: { ...options, model, timeoutMs: options.timeoutMs ?? settings.timeoutMs }
-                });
-                const usage = response.usage
-                    ? `, tokens in/out ${response.usage.inputTokens}/${response.usage.outputTokens}`
-                    : '';
-                this.log(`[${this.provider.id}] ${response.model} OK in ${Date.now() - started} ms (prompt ${promptChars} chars${usage})`);
-                return response;
-            } catch (error) {
-                const aiError = error instanceof AIError
-                    ? error
-                    : new AIError('PROVIDER_ERROR', String(error), this.provider.id, undefined, error);
-                this.log(`[${this.provider.id}] ${model} failed after ${Date.now() - started} ms: ${aiError.code} ${aiError.message}`);
+const maxRetries = Math.max(0, requestMaxRetries ?? this.maxRetries);
+const model = this.model;
+const promptChars = messages.reduce(
+    (sum, message) => sum + message.content.length,
+    0
+);
 
-                // Timeouts are not retried automatically: the user already waited the full timeout.
-                const transient = aiError.isRetryable && aiError.code !== 'TIMEOUT';
-                if (!transient || attempt >= this.maxRetries || options.signal?.aborted) {
-                    throw aiError;
-                }
-                const wait = calculateRetryDelay(
-                    this.retryDelayMs,
-                    attempt,
-                    this.retryJitterMs
-                );
-                this.log(`[${this.provider.id}] retrying in ${wait} ms (attempt ${attempt + 2}/${this.maxRetries + 1})`);
-                try {
-                    await delay(wait, options.signal);
-                } catch {
-                    throw new AIError('CANCELLED', 'The request was cancelled.', this.provider.id);
-                }
+for (let attempt = 0; ; attempt++) {
+    const started = Date.now();
+
+    try {
+        const response = await this.provider.generate({
+            messages,
+            options: {
+                ...providerOptions,
+                model,
+                timeoutMs: providerOptions.timeoutMs ?? settings.timeoutMs
             }
+        });
+
+        const usage = response.usage
+            ? `, tokens in/out ${response.usage.inputTokens}/${response.usage.outputTokens}`
+            : '';
+
+        this.log(
+            `[${this.provider.id}] ${response.model} OK in ${Date.now() - started} ms ` +
+            `(prompt ${promptChars} chars${usage})`
+        );
+
+        return response;
+    } catch (error) {
+        const aiError = error instanceof AIError
+            ? error
+            : new AIError(
+                'PROVIDER_ERROR',
+                String(error),
+                this.provider.id,
+                undefined,
+                error
+            );
+
+        this.log(
+            `[${this.provider.id}] ${model} failed after ${Date.now() - started} ms: ` +
+            `${aiError.code} ${aiError.message}`
+        );
+
+        const transient = aiError.isRetryable && aiError.code !== 'TIMEOUT';
+
+        if (
+            !transient ||
+            attempt >= maxRetries ||
+            options.signal?.aborted
+        ) {
+            throw aiError;
         }
+
+        const wait = calculateRetryDelay(
+            this.retryDelayMs,
+            attempt,
+            this.retryJitterMs,
+            this.random
+        );
+
+        this.log(
+            `[${this.provider.id}] retrying in ${wait} ms ` +
+            `(attempt ${attempt + 2}/${maxRetries + 1})`
+        );
+
+        try {
+            await delay(wait, options.signal);
+        } catch {
+            throw new AIError(
+                'CANCELLED',
+                'The request was cancelled.',
+                this.provider.id
+            );
+        }
+    }
+}
+
     }
 
     /**
@@ -243,18 +299,18 @@ export class AIService {
 
                 const totalDuration = Date.now() - started;
 
-                const firstChunkDuration = firstChunkAt !== undefined
-                    ? `${firstChunkAt - started} ms`
-                    : 'Not received';
+                const firstChunkDuration =
+                    firstChunkAt !== undefined
+                        ? `${firstChunkAt - started} ms`
+                        : 'Not received';
 
                 this.log(
-                    `[${this.provider.id}] ${model} STREAM failed | ` +
-                    `total ${totalDuration} ms | ` +
-                    `first chunk ${firstChunkDuration} | ` +
-                    `chunks ${chunkCount} | ` +
-                    `error ${aiError.code}: ${aiError.message}`
+                    `[${this.provider.id}] ${model} STREAM FAILED` +
+                    ` | total ${totalDuration} ms` +
+                    ` | first chunk ${firstChunkDuration}` +
+                    ` | chunks ${chunkCount}` +
+                    ` | error ${aiError.code}: ${aiError.message}`
                 );
-
                 const transient =
                     aiError.isRetryable && aiError.code !== 'TIMEOUT';
 
@@ -269,7 +325,12 @@ export class AIService {
                     throw aiError;
                 }
 
-                const wait = this.retryDelayMs * 2 ** attempt;
+                const wait = calculateRetryDelay(
+                    this.retryDelayMs,
+                    attempt,
+                    this.retryJitterMs,
+                    this.random
+                );
 
                 this.log(
                     `[${this.provider.id}] STREAM retrying in ${wait} ms (attempt ${attempt + 2}/${this.maxRetries + 1})`
@@ -310,10 +371,18 @@ export class AIService {
 function calculateRetryDelay(
     baseDelayMs: number,
     attempt: number,
-    jitterMs: number
+    jitterMs: number,
+    random: () => number
 ): number {
     const exponentialDelay = baseDelayMs * 2 ** attempt;
-    const jitter = Math.floor(Math.random() * (jitterMs + 1));
+
+    // Clamp random value to [0, 1).
+    const randomValue = Math.min(
+        Math.max(random(), 0),
+        1 - Number.EPSILON
+    );
+
+    const jitter = Math.floor(randomValue * (jitterMs + 1));
 
     return exponentialDelay + jitter;
 }
