@@ -81,12 +81,9 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
             }
 
             await this.executor.execute(['rev-parse', '--is-inside-work-tree']);
-            const [files, branch, trackingBranch, aheadBehind, branches,
-                remotes, conflicts, mergeInProgress] = await Promise.all([
+            const [files, branch, branches, remotes, conflicts, mergeInProgress] = await Promise.all([
                 this.statusService.getStatus(),
                 this.branchService.getCurrentBranch(),
-                this.branchService.getTrackingBranch(),
-                this.statusService.getAheadBehind(),
                 this.branchService.getBranches(),
                 this.remoteService.getRemotes(),
                 this.conflictService.getConflicts(),
@@ -118,9 +115,9 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                 repositoryPath: workspacePath,
                 files,
                 branch: branch.name,
-                trackingBranch,
-                ahead: aheadBehind.ahead,
-                behind: aheadBehind.behind,
+                trackingBranch: branch.tracking,
+                ahead: branch.tracking ? branch.ahead : null,
+                behind: branch.tracking ? branch.behind : null,
                 branches,
                 remotes,
                 conflicts,
@@ -223,27 +220,19 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                     if (!message.branch) {
                         throw new Error('Không tìm thấy source branch.');
                     }
-                    const confirmation = await vscode.window.showWarningMessage(
-                        `Merge "${message.branch}" vào branch hiện tại?`,
-                        { modal: true },
-                        'Merge'
-                    );
-                    if (confirmation !== 'Merge') {
+                    await this.mergeBranchIntoCurrent(message.branch);
+                    return;
+                }
+                case 'mergeFetched': {
+                    const trackingBranch = await this.branchService.getTrackingBranch();
+                    const source = trackingBranch ?? await this.pickRemoteBranch();
+                    if (!source) {
                         return;
                     }
-                    const result = await this.branchService.mergeBranch(
-                        message.branch
-                    );
-                    await this.refresh();
-                    if (result === 'conflicts') {
-                        void vscode.window.showWarningMessage(
-                            'Merge có conflict. Hãy giải quyết trong trang Conflict.'
-                        );
-                    } else {
-                        void vscode.window.showInformationMessage(
-                            `Đã merge "${message.branch}" thành công.`
-                        );
-                    }
+                    const branchName = typeof source === 'string'
+                        ? source
+                        : `${source.remote}/${source.branch}`;
+                    await this.mergeBranchIntoCurrent(branchName);
                     return;
                 }
                 case 'deleteBranch': {
@@ -451,27 +440,39 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                 break;
             }
             case 'push': {
-                if (await this.branchService.getTrackingBranch()) {
-                    await this.remoteService.push();
-                    break;
+                try {
+                    if (await this.branchService.getTrackingBranch()) {
+                        await this.remoteService.push();
+                        break;
+                    }
+                    const remotes = await this.remoteService.getRemotes();
+                    if (remotes.length === 0) {
+                        throw new Error('Không có remote nào được cấu hình.');
+                    }
+                    const remote = await vscode.window.showQuickPick(
+                        remotes.map(item => item.name),
+                        { placeHolder: 'Chọn remote để push branch hiện tại' }
+                    );
+                    if (!remote) {
+                        return false;
+                    }
+                    const currentBranch = await this.branchService.getCurrentBranch();
+                    await this.remoteService.push(
+                        remote,
+                        currentBranch.name,
+                        true
+                    );
+                } catch (error) {
+                    if (isPushRejectedBecauseRemoteAdvanced(error)) {
+                        throw new Error(
+                            'Push bị từ chối vì remote có commit mà branch local chưa có. ' +
+                            'Hãy Fetch rồi dùng nút Merge incoming changes (hoặc Merge fetched branch nếu chưa có upstream), ' +
+                            'xử lý conflict nếu có, sau đó Push lại. ' +
+                            'Không có force-push nào được thực hiện.'
+                        );
+                    }
+                    throw error;
                 }
-                const remotes = await this.remoteService.getRemotes();
-                if (remotes.length === 0) {
-                    throw new Error('Không có remote nào được cấu hình.');
-                }
-                const remote = await vscode.window.showQuickPick(
-                    remotes.map(item => item.name),
-                    { placeHolder: 'Chọn remote để push branch hiện tại' }
-                );
-                if (!remote) {
-                    return false;
-                }
-                const currentBranch = await this.branchService.getCurrentBranch();
-                await this.remoteService.push(
-                    remote,
-                    currentBranch.name,
-                    true
-                );
                 break;
             }
             default:
@@ -479,6 +480,29 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         }
         void vscode.window.showInformationMessage(`${action} hoàn tất.`);
         return true;
+    }
+
+    private async mergeBranchIntoCurrent(branchName: string): Promise<void> {
+        const confirmation = await vscode.window.showWarningMessage(
+            `Merge "${branchName}" vào branch hiện tại?`,
+            { modal: true },
+            'Merge'
+        );
+        if (confirmation !== 'Merge') {
+            return;
+        }
+
+        const result = await this.branchService.mergeBranch(branchName);
+        await this.refresh();
+        if (result === 'conflicts') {
+            void vscode.window.showWarningMessage(
+                'Merge có conflict. Hãy giải quyết trong trang Conflict.'
+            );
+        } else {
+            void vscode.window.showInformationMessage(
+                `Đã merge "${branchName}" thành công.`
+            );
+        }
     }
 
     private async pickRemoteBranch(): Promise<{
@@ -584,6 +608,12 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
     }
+}
+
+function isPushRejectedBecauseRemoteAdvanced(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /(?:fetch first|non-fast-forward|remote contains work that you do not have locally)/i
+        .test(message);
 }
 
 function getNonce(): string {

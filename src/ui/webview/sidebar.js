@@ -177,8 +177,9 @@ function renderPage() {
     document.getElementById('conflictBadge').textContent = String(conflicts.length);
     document.getElementById('currentBranch').textContent =
         `⑂ ${repository.branch || '—'}`;
+    const syncCounts = getSyncCounts();
     document.querySelector('.status-bar span:nth-child(2)').textContent =
-        `↑ ${repository.ahead ?? 0} ↓ ${repository.behind ?? 0}`;
+        `↑ ${syncCounts.ahead} ↓ ${syncCounts.behind}`;
 
     const pages = {
         overview: () => renderOverview(files, staged, unstaged, conflicts),
@@ -194,6 +195,18 @@ function renderPage() {
     content.innerHTML = pages[page]();
 }
 
+function getSyncCounts() {
+    const hasUpstream = Boolean(repository.trackingBranch);
+    return {
+        ahead: hasUpstream && Number.isInteger(repository.ahead) ? repository.ahead : '—',
+        behind: hasUpstream && Number.isInteger(repository.behind) ? repository.behind : '—'
+    };
+}
+
+function noUpstreamMessage() {
+    return 'No upstream configured. Push this branch or pull a remote branch to set one and show ahead/behind.';
+}
+
 function aiButton(task, action, label, busyLabel, extra = '', className = 'secondary-button') {
     const busy = isBusy(task);
     return `<button class="${className}" type="button" data-action="${action}" ${extra} ${busy ? 'disabled' : ''}>${busy ? `<span class="spinner"></span>${busyLabel}` : label}</button>`;
@@ -207,6 +220,7 @@ function cancelButton(task) {
 
 function renderOverview(files, staged, unstaged, conflicts) {
     const clean = files.length === 0;
+    const syncCounts = getSyncCounts();
     return `
         <section class="repo-card card">
             <div class="section-heading"><span class="eyebrow">REPOSITORY</span>
@@ -217,11 +231,11 @@ function renderOverview(files, staged, unstaged, conflicts) {
             <div class="divider"></div>
             <span class="eyebrow">CURRENT BRANCH</span>
             <strong class="branch-name">${escapeHtml(repository.branch || 'Detached HEAD')}</strong>
-            <p class="muted">Tracking: ${escapeHtml(repository.trackingBranch || '—')}</p>
+            <p class="muted">${repository.trackingBranch ? `Tracking: ${escapeHtml(repository.trackingBranch)}` : noUpstreamMessage()}</p>
         </section>
         <div class="stats-grid">
-            <section class="stat-card card"><span class="muted">↑ Ahead</span><strong>${repository.ahead ?? 0}</strong><small>commits</small></section>
-            <section class="stat-card card"><span class="muted">↓ Behind</span><strong>${repository.behind ?? 0}</strong><small>commits</small></section>
+            <section class="stat-card card"><span class="muted">↑ Ahead</span><strong>${syncCounts.ahead}</strong><small>commits</small></section>
+            <section class="stat-card card"><span class="muted">↓ Behind</span><strong>${syncCounts.behind}</strong><small>commits</small></section>
         </div>
         <section class="card">
             <div class="section-heading"><h2>Changes</h2><span class="badge">${files.length} files</span></div>
@@ -232,7 +246,7 @@ function renderOverview(files, staged, unstaged, conflicts) {
         <section class="insight-card card">
             <div class="section-heading"><h2>AI Insights</h2><span class="badge ${aiReady() ? 'success' : 'warning'}">${aiReady() ? 'AI ready' : 'AI chưa cấu hình'}</span></div>
             <p class="insight-line">${clean ? '✓ Working tree is clean.' : `● ${files.length} file(s) have changes.`}</p>
-            <p class="insight-line">↑ ${repository.ahead ?? 0} commit(s) ahead of upstream.</p>
+            <p class="insight-line">${repository.trackingBranch ? `↑ ${syncCounts.ahead} commit(s) ahead of upstream.` : noUpstreamMessage()}</p>
             <p class="insight-line">${conflicts.length ? `⚠ ${conflicts.length} merge conflict(s) need attention.` : '✓ No merge conflicts.'}</p>
             ${aiReady() ? '' : '<button class="text-button" data-page-link="settings">Cấu hình AI →</button>'}
         </section>
@@ -291,6 +305,7 @@ function renderCommit(staged) {
 }
 
 function renderBranches(branches) {
+    const syncCounts = getSyncCounts();
     return `<section class="card">
         <div class="section-heading"><h2>Branches</h2><button class="icon-button" data-action="refresh">⟳</button></div>
         <button class="primary-button wide create-branch" data-action="createBranch">＋ Create branch</button>
@@ -298,7 +313,7 @@ function renderBranches(branches) {
         <input class="filter-input" id="branchFilter" placeholder="⌕ Search branches..." />
         <div class="branch-list">${branches.map(branch => `<div class="branch-row"><div class="branch-name-wrap"><strong>${branch.current ? '● ' : '⑂ '}${escapeHtml(branch.name)}</strong><small>${escapeHtml(branch.tracking || (branch.isRemote ? 'Remote branch' : 'Local branch'))}</small></div><div class="branch-actions">${branch.current ? '<span class="badge success">Current</span>' : `<button class="secondary-button" data-action="switchBranch" data-branch="${escapeAttr(branch.name)}">Checkout</button><button class="text-button" data-action="mergeBranch" data-branch="${escapeAttr(branch.name)}">Merge</button>`}${branch.isRemote ? (branch.remoteName && branch.remoteBranch ? `<button class="text-button" data-action="deleteRemoteBranch" data-remote-name="${escapeAttr(branch.remoteName)}" data-remote-branch="${escapeAttr(branch.remoteBranch)}">Delete remote</button>` : '') : `<button class="text-button" data-action="renameBranch" data-branch="${escapeAttr(branch.name)}">Rename</button><button class="text-button" data-action="deleteBranch" data-branch="${escapeAttr(branch.name)}">Delete</button>`}</div></div>`).join('') || '<p class="muted">No branches found.</p>'}</div>
     </section>
-    <section class="card"><h2>Branch status</h2><p class="muted">${repository.ahead ?? 0} ahead · ${repository.behind ?? 0} behind ${escapeHtml(repository.trackingBranch || 'upstream')}</p><button class="secondary-button wide" data-page-link="sync">Sync with remote</button></section>
+    <section class="card"><h2>Branch status</h2><p class="muted">${repository.trackingBranch ? `${syncCounts.ahead} ahead · ${syncCounts.behind} behind ${escapeHtml(repository.trackingBranch)}` : noUpstreamMessage()}</p><button class="secondary-button wide" data-page-link="sync">Sync with remote</button></section>
     <section class="card"><h2>AI Branch Summary</h2><p class="muted">So sánh branch hiện tại với một branch gốc (main, develop...) và tóm tắt mục đích, rủi ro, gợi ý Pull Request.</p>
         ${aiButton('branchSummary', 'aiSummarizeBranch', '✦ Tóm tắt branch', 'Đang tóm tắt...', '', 'secondary-button wide')}${cancelButton('branchSummary')}
     </section>`;
@@ -330,10 +345,22 @@ function renderHistory(history) {
 
 function renderSync() {
     const remotes = repository.remotes ?? [];
+    const syncCounts = getSyncCounts();
+    const mergeButton = repository.trackingBranch
+        ? Number.isInteger(repository.behind) && repository.behind > 0
+            ? '<button class="secondary-button wide" data-action="mergeFetched">Merge incoming changes</button>'
+            : ''
+        : '<button class="secondary-button wide" data-action="mergeFetched">Merge fetched branch</button>';
+    const mergeHint = repository.trackingBranch
+        ? ''
+        : '<p class="muted">Fetch first, then choose the remote branch to merge into the current branch.</p>';
     return `<section class="card"><div class="section-heading"><h2>Sync Repository</h2><span class="badge info">${escapeHtml(repository.branch || 'Branch')}</span></div>
-        <p class="muted">Tracking: ${escapeHtml(repository.trackingBranch || 'No upstream configured')}</p>
-        <div class="stats-grid compact"><div class="stat-card card"><span class="muted">↑ Ahead</span><strong>${repository.ahead ?? 0}</strong></div><div class="stat-card card"><span class="muted">↓ Behind</span><strong>${repository.behind ?? 0}</strong></div></div>
+        <p class="muted">Tracking: ${escapeHtml(repository.trackingBranch || '—')}</p>
+        ${repository.trackingBranch ? '' : `<p class="muted">${noUpstreamMessage()}</p>`}
+        <div class="stats-grid compact"><div class="stat-card card"><span class="muted">↑ Ahead</span><strong>${syncCounts.ahead}</strong></div><div class="stat-card card"><span class="muted">↓ Behind</span><strong>${syncCounts.behind}</strong></div></div>
+        ${mergeHint}
         <div class="sync-actions"><button class="secondary-button" data-action="sync" data-sync="fetch">⟳ Fetch</button><button class="secondary-button" data-action="sync" data-sync="pull">↓ Pull</button><button class="primary-button" data-action="sync" data-sync="push">↑ Push</button></div>
+        ${mergeButton}
     </section>
     <section class="card"><h2>Remotes</h2>${remotes.map(remote => `<p class="remote-row"><strong>${escapeHtml(remote.name)}</strong><span class="muted">${escapeHtml(remote.fetchUrl || 'No fetch URL')}</span></p>`).join('') || '<p class="muted">No remotes configured.</p>'}</section>`;
 }

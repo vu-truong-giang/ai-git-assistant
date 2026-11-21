@@ -81,15 +81,44 @@ export class GitStatusService implements IStatusService {
         return allStatus.filter(file => file.status === 'untracked');
     }
     async getAheadBehind(): Promise<GitAheadBehind> {
-        try {
-            const stdout = await this.executor.execute(['rev-list', '--left-right', '--count', 'HEAD...@{u}']);
-            const [aheadStr, behindStr] = stdout.trim().split('\t');
-            const ahead = parseInt(aheadStr, 10);
-            const behind = parseInt(behindStr, 10);
-            return { ahead, behind };
-        } catch {
-            console.error('Failed to get ahead/behind information');
+    try {
+        // Kiểm tra upstream.
+        const upstream = (
+            await this.executor.execute([
+                'rev-parse',
+                '--abbrev-ref',
+                '--symbolic-full-name',
+                '@{upstream}'
+            ])
+        ).trim();
+
+        // Không có upstream: đây không phải lỗi cần cảnh báo.
+        if (!upstream) {
             return { ahead: 0, behind: 0 };
-        }   
+        }
+
+        const stdout = await this.executor.execute([
+            'rev-list',
+            '--left-right',
+            '--count',
+            `HEAD...${upstream}`
+        ]);
+
+        const [aheadStr, behindStr] = stdout.trim().split(/\s+/);
+
+        const ahead = Number(aheadStr);
+        const behind = Number(behindStr);
+
+        if (!Number.isInteger(ahead) || !Number.isInteger(behind)) {
+            throw new Error(`Invalid ahead/behind output: ${stdout}`);
+        }
+
+        return { ahead, behind };
+    } catch (error) {
+        // Git không có upstream thường trả về lỗi ở bước kiểm tra.
+        // Không nên coi mọi lỗi đều là trường hợp bình thường.
+        console.error('Failed to get ahead/behind information:', error);
+        return { ahead: 0, behind: 0 };
     }
+}
 }
