@@ -10,7 +10,7 @@
     "sourceMap": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node", "mocha"]
+    "types": ["node"]
   },
   "exclude": ["node_modules", ".vscode-test", "dist"]
 }

@@ -9,16 +9,30 @@ export class GitBranchService implements IBranchService {
 
     async getCurrentBranch(): Promise<GitBranch> {
         try {
-            const name = (await this.executor.execute(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+            const name = (
+                await this.executor.execute([
+                    'rev-parse',
+                    '--abbrev-ref',
+                    'HEAD'
+                ])
+            ).trim();
 
             const tracking = await this.getTrackingBranch();
 
-            const { ahead, behind } = await this.statusService.getAheadBehind();
+            let ahead = 0;
+            let behind = 0;
+
+            if (tracking) {
+                ({ ahead, behind } =
+                    await this.statusService.getAheadBehind());
+            }
 
             return {
                 name,
                 current: true,
-                remote: tracking ? tracking.split('/')[0] : undefined,
+                remote: tracking
+                    ? tracking.split('/')[0]
+                    : undefined,
                 tracking,
                 ahead,
                 behind

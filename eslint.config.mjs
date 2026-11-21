@@ -13,6 +13,7 @@ export default tseslint.config(
       globals: {
         acquireVsCodeApi: 'readonly',
         document: 'readonly',
+        requestAnimationFrame: 'readonly',
         window: 'readonly'
       }
     }

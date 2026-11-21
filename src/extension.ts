@@ -27,6 +27,12 @@ import { GitRemoteService } from './git/services/GitRemote.service';
 import { WorkspaceService } from './workspace/workspaceService.service';
 import { IWorkspaceService } from './workspace/IWorkspaceService.interface';
 
+// ========================================
+// AI Layer
+// ========================================
+import { ApiKeyManager } from './ai/ApiKeyManager';
+import { AIController } from './ui/AIController';
+
 export function activate(context: vscode.ExtensionContext): void {
 
     // ========================================
@@ -115,6 +121,26 @@ export function activate(context: vscode.ExtensionContext): void {
         wsPath ?? context.extensionPath
     );
     const remoteService = new GitRemoteService(executor);
+    const diffService = new GitDiffService(executor);
+
+    // ========================================
+    // 8. AI (EPIC 07-13)
+    // ========================================
+    const apiKeys = new ApiKeyManager(context.secrets);
+    const aiController = wsPath
+        ? new AIController(context, apiKeys, {
+            workspaceRoot: wsPath,
+            status: statusService,
+            diff: diffService,
+            branch: branchService,
+            commit: commitService,
+            conflict: conflictService
+        })
+        : undefined;
+    if (aiController) {
+        context.subscriptions.push(aiController);
+    }
+    registerAiCommands(context, apiKeys, aiController);
 
     const sidebarProvider = new GitSidebarViewProvider(
         context.extensionUri,
@@ -124,7 +150,8 @@ export function activate(context: vscode.ExtensionContext): void {
         branchService,
         commitService,
         conflictService,
-        remoteService
+        remoteService,
+        aiController
     );
 
     context.subscriptions.push(
@@ -142,6 +169,10 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand(
             'aiGitAssistant.refreshSidebarViews',
             () => sidebarProvider.refresh()
+        ),
+        vscode.commands.registerCommand(
+            'aiGitAssistant.showPage',
+            (page: string) => sidebarProvider.showPage(page)
         )
     );
 
@@ -194,8 +225,6 @@ export function activate(context: vscode.ExtensionContext): void {
     // ========================================
     // 11. Git Diff Service
     // ========================================
-    const diffService = new GitDiffService(executor);
-
     const diffProvider = new GitDiffContentProvider(diffService);
 
     // Register Git Diff Content Provider
@@ -305,6 +334,60 @@ export function activate(context: vscode.ExtensionContext): void {
 
         vscode.workspace.onDidRenameFiles(() => {
             refreshSidebar();
+        })
+    );
+}
+
+function registerAiCommands(
+    context: vscode.ExtensionContext,
+    apiKeys: ApiKeyManager,
+    ai: AIController | undefined
+): void {
+    const requireWorkspace = (run: (controller: AIController) => unknown) => () => {
+        if (!ai) {
+            void vscode.window.showWarningMessage('Mở một workspace Git để dùng tính năng AI.');
+            return;
+        }
+        return run(ai);
+    };
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('aiGitAssistant.ai.setApiKey', async () => {
+            if (ai) {
+                await ai.setApiKey();
+            } else if (await apiKeys.promptForApiKey()) {
+                void vscode.window.showInformationMessage('Đã lưu Gemini API key.');
+            }
+        }),
+        vscode.commands.registerCommand('aiGitAssistant.ai.clearApiKey', async () => {
+            if (ai) {
+                await ai.clearApiKey();
+            } else {
+                await apiKeys.deleteApiKey();
+            }
+        }),
+        vscode.commands.registerCommand('aiGitAssistant.ai.testConnection', requireWorkspace(c => c.testConnection())),
+        vscode.commands.registerCommand('aiGitAssistant.ai.selectModel', requireWorkspace(c => c.selectModel())),
+        vscode.commands.registerCommand('aiGitAssistant.ai.generateCommitMessage',
+            (sourceControl?: { rootUri?: vscode.Uri }) => requireWorkspace(c => c.generateCommitMessageForScm(sourceControl))()),
+        vscode.commands.registerCommand('aiGitAssistant.ai.explainChanges', requireWorkspace(c => c.explainChanges('auto'))),
+        vscode.commands.registerCommand('aiGitAssistant.ai.explainStagedChanges', requireWorkspace(c => c.explainChanges('staged'))),
+        vscode.commands.registerCommand('aiGitAssistant.ai.reviewChanges', requireWorkspace(c => c.reviewChanges('auto'))),
+        vscode.commands.registerCommand('aiGitAssistant.ai.summarizeHistory', requireWorkspace(c => c.summarizeHistory())),
+        vscode.commands.registerCommand('aiGitAssistant.ai.summarizeBranch', requireWorkspace(c => c.summarizeBranch())),
+        vscode.commands.registerCommand('aiGitAssistant.ai.resolveConflict', requireWorkspace(async c => {
+            const editor = vscode.window.activeTextEditor;
+            const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!editor || !root) {
+                void vscode.window.showWarningMessage('Mở file đang bị conflict trong editor trước.');
+                return;
+            }
+            const relative = path.relative(root, editor.document.uri.fsPath).split(path.sep).join('/');
+            await c.suggestConflictResolution(relative);
+        })),
+        vscode.commands.registerCommand('aiGitAssistant.ai.openChat', async () => {
+            await vscode.commands.executeCommand('workbench.view.extension.aiGitAssistant');
+            await vscode.commands.executeCommand('aiGitAssistant.showPage', 'aiChat');
         })
     );
 }

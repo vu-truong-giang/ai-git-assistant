@@ -7,6 +7,7 @@ import { GitConflictService } from '../git/services/GitConflict.service';
 import { GitRemoteService } from '../git/services/GitRemote.service';
 import { GitStatusService } from '../git/services/GitStatus.service';
 import { IWorkspaceService } from '../workspace/IWorkspaceService.interface';
+import { AIController, AITask } from './AIController';
 
 interface SidebarMessage {
     command?: string;
@@ -17,12 +18,16 @@ interface SidebarMessage {
     remoteBranch?: string;
     action?: string;
     resolution?: 'ours' | 'theirs' | 'both';
+    scope?: string;
+    task?: string;
 }
 
 export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiGitAssistant.overview';
 
     private view?: vscode.WebviewView;
+    /** Page requested before the webview script was ready to receive messages. */
+    private pendingPage?: string;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -32,7 +37,8 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         private readonly branchService: GitBranchService,
         private readonly commitService: GitCommitService,
         private readonly conflictService: GitConflictService,
-        private readonly remoteService: GitRemoteService
+        private readonly remoteService: GitRemoteService,
+        private readonly ai?: AIController
     ) {}
 
     resolveWebviewView(view: vscode.WebviewView): void {
@@ -47,6 +53,12 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         view.webview.onDidReceiveMessage((message: SidebarMessage) => {
             void this.handleMessage(message);
         });
+        if (this.ai) {
+            const subscription = this.ai.onDidChangeState(state => {
+                void view.webview.postMessage({ command: 'aiState', state });
+            });
+            view.onDidDispose(() => subscription.dispose());
+        }
         void this.refresh();
     }
 
@@ -69,12 +81,9 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
             }
 
             await this.executor.execute(['rev-parse', '--is-inside-work-tree']);
-            const [files, branch, trackingBranch, aheadBehind, branches,
-                remotes, conflicts, mergeInProgress] = await Promise.all([
+            const [files, branch, branches, remotes, conflicts, mergeInProgress] = await Promise.all([
                 this.statusService.getStatus(),
                 this.branchService.getCurrentBranch(),
-                this.branchService.getTrackingBranch(),
-                this.statusService.getAheadBehind(),
                 this.branchService.getBranches(),
                 this.remoteService.getRemotes(),
                 this.conflictService.getConflicts(),
@@ -106,9 +115,9 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                 repositoryPath: workspacePath,
                 files,
                 branch: branch.name,
-                trackingBranch,
-                ahead: aheadBehind.ahead,
-                behind: aheadBehind.behind,
+                trackingBranch: branch.tracking,
+                ahead: branch.tracking ? branch.ahead : null,
+                behind: branch.tracking ? branch.behind : null,
                 branches,
                 remotes,
                 conflicts,
@@ -122,7 +131,12 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
     }
 
     showPage(page: string): void {
-        this.view?.webview.postMessage({ command: 'navigate', page });
+        this.pendingPage = page;
+        void this.view?.webview.postMessage({ command: 'navigate', page }).then(delivered => {
+            if (delivered) {
+                this.pendingPage = undefined;
+            }
+        });
     }
 
     private async handleMessage(message: SidebarMessage): Promise<void> {
@@ -149,18 +163,42 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                         return;
                     }
                     await this.commitService.commit(commitMessage);
+                    void this.view?.webview.postMessage({ command: 'commitDone' });
                     void vscode.window.showInformationMessage('Commit thành công.');
                     break;
                 }
-                case 'generateCommitMessage':
-                    void vscode.window.showInformationMessage(
-                        'AI chưa được kết nối. Hãy cấu hình AI provider trong Settings để tạo commit message.'
-                    );
-                    await vscode.commands.executeCommand(
-                        'workbench.action.openSettings',
-                        'aiGitAssistant.ai'
-                    );
+                case 'generateCommitMessage': {
+                    if (!this.ai) {
+                        void vscode.window.showWarningMessage('Mở một workspace Git để dùng AI.');
+                        return;
+                    }
+                    const generated = await this.ai.generateCommitMessage('staged');
+                    if (generated) {
+                        void this.view?.webview.postMessage({ command: 'commitMessage', message: generated });
+                    }
                     return;
+                }
+                case 'aiReady':
+                case 'copyText':
+                case 'aiExplainChanges':
+                case 'aiReviewChanges':
+                case 'aiChatSend':
+                case 'aiChatClear':
+                case 'aiCancel':
+                case 'aiSetApiKey':
+                case 'aiClearApiKey':
+                case 'aiTestConnection':
+                case 'aiSelectModel':
+                case 'aiSummarizeHistory':
+                case 'aiSummarizeBranch':
+                    await this.handleAiMessage(message);
+                    return;
+                case 'aiResolveConflict':
+                    if (!this.ai || !message.filePath
+                        || !await this.ai.suggestConflictResolution(message.filePath)) {
+                        return;
+                    }
+                    break;
                 case 'createBranch': {
                     const branchName = await vscode.window.showInputBox({
                         prompt: 'Nhập tên branch mới',
@@ -182,27 +220,19 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                     if (!message.branch) {
                         throw new Error('Không tìm thấy source branch.');
                     }
-                    const confirmation = await vscode.window.showWarningMessage(
-                        `Merge "${message.branch}" vào branch hiện tại?`,
-                        { modal: true },
-                        'Merge'
-                    );
-                    if (confirmation !== 'Merge') {
+                    await this.mergeBranchIntoCurrent(message.branch);
+                    return;
+                }
+                case 'mergeFetched': {
+                    const trackingBranch = await this.branchService.getTrackingBranch();
+                    const source = trackingBranch ?? await this.pickRemoteBranch();
+                    if (!source) {
                         return;
                     }
-                    const result = await this.branchService.mergeBranch(
-                        message.branch
-                    );
-                    await this.refresh();
-                    if (result === 'conflicts') {
-                        void vscode.window.showWarningMessage(
-                            'Merge có conflict. Hãy giải quyết trong trang Conflict.'
-                        );
-                    } else {
-                        void vscode.window.showInformationMessage(
-                            `Đã merge "${message.branch}" thành công.`
-                        );
-                    }
+                    const branchName = typeof source === 'string'
+                        ? source
+                        : `${source.remote}/${source.branch}`;
+                    await this.mergeBranchIntoCurrent(branchName);
                     return;
                 }
                 case 'deleteBranch': {
@@ -305,6 +335,58 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async handleAiMessage(message: SidebarMessage): Promise<void> {
+        if (message.command === 'aiReady' && this.pendingPage) {
+            void this.view?.webview.postMessage({ command: 'navigate', page: this.pendingPage });
+            this.pendingPage = undefined;
+        }
+        if (message.command === 'copyText') {
+            if (message.message?.trim()) {
+                await vscode.env.clipboard.writeText(message.message);
+                void vscode.window.showInformationMessage('Đã copy commit message.');
+            }
+            return;
+        }
+        if (!this.ai) {
+            if (message.command !== 'aiReady') {
+                void vscode.window.showWarningMessage('Mở một workspace Git để dùng AI.');
+            }
+            return;
+        }
+        const scope = message.scope === 'staged' || message.scope === 'all' ? message.scope : 'auto';
+        switch (message.command) {
+            case 'aiReady':
+                void this.view?.webview.postMessage({ command: 'aiState', state: this.ai.getState() });
+                return;
+            case 'aiExplainChanges':
+                return this.ai.explainChanges(scope);
+            case 'aiReviewChanges':
+                return this.ai.reviewChanges(scope);
+            case 'aiChatSend': {
+                const ok = await this.ai.chat(message.message ?? '');
+                void this.view?.webview.postMessage({ command: 'chatSent', ok });
+                return;
+            }
+            case 'aiChatClear':
+                return this.ai.clearChat();
+            case 'aiCancel':
+                this.ai.cancel(message.task as AITask | undefined);
+                return;
+            case 'aiSetApiKey':
+                return this.ai.setApiKey();
+            case 'aiClearApiKey':
+                return this.ai.clearApiKey();
+            case 'aiTestConnection':
+                return this.ai.testConnection();
+            case 'aiSelectModel':
+                return this.ai.selectModel();
+            case 'aiSummarizeHistory':
+                return this.ai.summarizeHistory();
+            case 'aiSummarizeBranch':
+                return this.ai.summarizeBranch();
+        }
+    }
+
     private async runPathCommand(
         args: string[],
         filePath: string | undefined
@@ -358,27 +440,39 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
                 break;
             }
             case 'push': {
-                if (await this.branchService.getTrackingBranch()) {
-                    await this.remoteService.push();
-                    break;
+                try {
+                    if (await this.branchService.getTrackingBranch()) {
+                        await this.remoteService.push();
+                        break;
+                    }
+                    const remotes = await this.remoteService.getRemotes();
+                    if (remotes.length === 0) {
+                        throw new Error('Không có remote nào được cấu hình.');
+                    }
+                    const remote = await vscode.window.showQuickPick(
+                        remotes.map(item => item.name),
+                        { placeHolder: 'Chọn remote để push branch hiện tại' }
+                    );
+                    if (!remote) {
+                        return false;
+                    }
+                    const currentBranch = await this.branchService.getCurrentBranch();
+                    await this.remoteService.push(
+                        remote,
+                        currentBranch.name,
+                        true
+                    );
+                } catch (error) {
+                    if (isPushRejectedBecauseRemoteAdvanced(error)) {
+                        throw new Error(
+                            'Push bị từ chối vì remote có commit mà branch local chưa có. ' +
+                            'Hãy Fetch rồi dùng nút Merge incoming changes (hoặc Merge fetched branch nếu chưa có upstream), ' +
+                            'xử lý conflict nếu có, sau đó Push lại. ' +
+                            'Không có force-push nào được thực hiện.'
+                        );
+                    }
+                    throw error;
                 }
-                const remotes = await this.remoteService.getRemotes();
-                if (remotes.length === 0) {
-                    throw new Error('Không có remote nào được cấu hình.');
-                }
-                const remote = await vscode.window.showQuickPick(
-                    remotes.map(item => item.name),
-                    { placeHolder: 'Chọn remote để push branch hiện tại' }
-                );
-                if (!remote) {
-                    return false;
-                }
-                const currentBranch = await this.branchService.getCurrentBranch();
-                await this.remoteService.push(
-                    remote,
-                    currentBranch.name,
-                    true
-                );
                 break;
             }
             default:
@@ -386,6 +480,29 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
         }
         void vscode.window.showInformationMessage(`${action} hoàn tất.`);
         return true;
+    }
+
+    private async mergeBranchIntoCurrent(branchName: string): Promise<void> {
+        const confirmation = await vscode.window.showWarningMessage(
+            `Merge "${branchName}" vào branch hiện tại?`,
+            { modal: true },
+            'Merge'
+        );
+        if (confirmation !== 'Merge') {
+            return;
+        }
+
+        const result = await this.branchService.mergeBranch(branchName);
+        await this.refresh();
+        if (result === 'conflicts') {
+            void vscode.window.showWarningMessage(
+                'Merge có conflict. Hãy giải quyết trong trang Conflict.'
+            );
+        } else {
+            void vscode.window.showInformationMessage(
+                `Đã merge "${branchName}" thành công.`
+            );
+        }
     }
 
     private async pickRemoteBranch(): Promise<{
@@ -491,6 +608,12 @@ export class GitSidebarViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
     }
+}
+
+function isPushRejectedBecauseRemoteAdvanced(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /(?:fetch first|non-fast-forward|remote contains work that you do not have locally)/i
+        .test(message);
 }
 
 function getNonce(): string {

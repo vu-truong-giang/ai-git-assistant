@@ -650,3 +650,232 @@ form input {
         margin: 0;
     }
 }
+
+/* ---------- AI features ---------- */
+
+.spinner {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    margin-right: 5px;
+    vertical-align: -1px;
+    border: 1.5px solid var(--muted);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: ai-spin .8s linear infinite;
+}
+
+@keyframes ai-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.ai-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    margin: 8px 0 4px;
+}
+
+.ai-actions .text-button {
+    text-align: left;
+}
+
+.inline-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.inline-actions .secondary-button,
+.inline-actions .primary-button {
+    flex: 1 1 0;
+}
+
+button:disabled {
+    cursor: not-allowed;
+    opacity: .55;
+}
+
+#commitInput {
+    min-height: 90px;
+    font-family: var(--vscode-editor-font-family);
+    line-height: 1.45;
+    resize: vertical;
+}
+
+.ai-suggest {
+    margin: 2px 0 8px;
+    border-color: var(--accent);
+}
+
+.ai-status-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+}
+
+.ai-status-row span:last-child {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    text-align: right;
+}
+
+.ai-status-row .ok {
+    color: var(--success);
+}
+
+.ai-status-row .bad {
+    color: var(--warning);
+}
+
+.chat-card {
+    display: flex;
+    flex-direction: column;
+}
+
+.chat-log {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 55vh;
+    min-height: 120px;
+    margin-bottom: 6px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+.chat-msg {
+    display: flex;
+}
+
+.chat-msg.user {
+    justify-content: flex-end;
+}
+
+.chat-bubble {
+    max-width: 92%;
+    padding: 6px 9px;
+    overflow-wrap: anywhere;
+    border-radius: 8px;
+    font-size: 10.5px;
+    line-height: 1.5;
+}
+
+.chat-msg.user .chat-bubble {
+    color: white;
+    background: var(--accent);
+}
+
+.chat-msg.assistant .chat-bubble {
+    border: 1px solid var(--border);
+    background: var(--vscode-editor-background);
+}
+
+.chat-bubble p {
+    margin: 3px 0;
+}
+
+.chat-bubble h1,
+.chat-bubble h2,
+.chat-bubble h3,
+.chat-bubble h4 {
+    margin: 6px 0 3px;
+    font-size: 11px;
+}
+
+.chat-bubble ul,
+.chat-bubble ol {
+    margin: 3px 0;
+    padding-left: 16px;
+}
+
+.chat-bubble code {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: var(--vscode-textCodeBlock-background);
+    font-family: var(--vscode-editor-font-family);
+    font-size: 10px;
+}
+
+.chat-bubble pre {
+    margin: 5px 0;
+    padding: 6px;
+    overflow-x: auto;
+    border-radius: 4px;
+    background: var(--vscode-textCodeBlock-background);
+}
+
+.chat-bubble pre code {
+    padding: 0;
+    background: transparent;
+}
+
+.chat-bubble table {
+    border-collapse: collapse;
+    font-size: 10px;
+}
+
+.chat-bubble th,
+.chat-bubble td {
+    padding: 2px 5px;
+    border: 1px solid var(--border);
+}
+
+.chat-bubble a {
+    color: var(--vscode-textLink-foreground);
+}
+
+.typing {
+    display: flex;
+    gap: 3px;
+    padding: 9px 11px;
+}
+
+.typing span {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--muted);
+    animation: ai-blink 1.2s infinite ease-in-out;
+}
+
+.typing span:nth-child(2) {
+    animation-delay: .2s;
+}
+
+.typing span:nth-child(3) {
+    animation-delay: .4s;
+}
+
+@keyframes ai-blink {
+    0%, 80%, 100% {
+        opacity: .25;
+    }
+    40% {
+        opacity: 1;
+    }
+}
+
+.chat-suggestions {
+    display: grid;
+    gap: 2px;
+}
+
+.chat-suggestions .suggestion {
+    padding: 4px 0;
+    text-align: left;
+}
+
+.chat-form {
+    gap: 4px;
+}
+
+#chatInput {
+    resize: vertical;
+}
